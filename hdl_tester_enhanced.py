@@ -33,12 +33,29 @@ class MultiDatasetHDLTester:
         gen_summary_path = self.verilog_dir / "generation_summary.json"
         if gen_summary_path.exists():
             try:
-                with open(gen_summary_path) as f:
+                with open(gen_summary_path, 'r', encoding='utf-8') as f:
                     self.generation_info = json.load(f)
                     return self.generation_info
             except Exception as e:
                 print(f"Warning: Could not load generation summary: {e}")
         return None
+    
+    def get_total_designs_from_dataset(self) -> int:
+        """Get total number of designs directly from dataset directory"""
+        try:
+            if self.dataset == "verilogeval":
+                # Count prompt files
+                prompt_files = list(self.dataset_dir.glob("*_prompt.txt"))
+                return len(prompt_files)
+            else:  # rtllm
+                # Count design directories with design_description.txt
+                designs = set()
+                for desc_file in self.dataset_dir.rglob("*/design_description.txt"):
+                    designs.add(desc_file.parent.name)
+                return len(designs)
+        except Exception as e:
+            print(f"Warning: Could not count designs from dataset: {e}")
+            return 0
     
     def analyze_prescreening_effectiveness(self):
         """Analyze how effective prescreening was"""
@@ -613,33 +630,48 @@ class MultiDatasetHDLTester:
             result = self.test_design(design_name, trial_files)
             self.results["design_results"][design_name] = result
         
-        # *** MODIFIED SECTION: Fixed pass@k calculation ***
-        # Get total expected designs from generation_info if available
+        # ===== FIXED: Corrected pass@k calculation =====
+        # Get total expected designs from multiple sources
         total_expected_designs = None
+        
+        # Source 1: generation_info (most reliable if available)
         if self.generation_info:
-            total_expected_designs = self.generation_info.get("total_designs", None)
+            # Use designs_attempted (excludes skipped designs)
+            total_expected_designs = self.generation_info.get("designs_attempted")
+            
+            # Fallback to total_designs if designs_attempted not available
+            if total_expected_designs is None:
+                total_expected_designs = self.generation_info.get("total_designs")
+        
+        # Source 2: Directly count from dataset (fallback)
+        if total_expected_designs is None:
+            total_expected_designs = self.get_total_designs_from_dataset()
+            if total_expected_designs > 0:
+                print(f"Warning: Using dataset directory count for total designs ({total_expected_designs})")
+        
+        # Source 3: Last resort - use tested designs count (least accurate)
+        if total_expected_designs is None or total_expected_designs == 0:
+            total_expected_designs = len(design_trials)
+            print(f"Warning: No reliable design count available, using tested count ({total_expected_designs})")
         
         # Calculate pass@k metrics with correct denominator
         pass_at_k = {}
         valid_results = [r for r in self.results["design_results"].values() if "error" not in r]
         
-        # Determine the correct total designs count
-        if total_expected_designs:
-            # Use the total from generation info (e.g., 50 for RTLLM, 156 for VerilogEval)
-            total_designs_for_calculation = total_expected_designs
-        else:
-            # Fallback: use the number of tested designs (less accurate)
-            total_designs_for_calculation = len(valid_results)
-            print(f"Warning: No total_designs in generation_info, using tested count ({total_designs_for_calculation})")
+        print(f"\nPass@k calculation:")
+        print(f"  Total expected designs: {total_expected_designs}")
+        print(f"  Designs with test results: {len(valid_results)}")
+        print(f"  Designs with no generated files: {total_expected_designs - len(valid_results)}")
         
         for k in Config.K_VALUES:
             if k > Config.N_SAMPLES:
                 # Skip if k is larger than the number of samples we generated
-                print(f"Skipping pass@{k} (k={k} > N_SAMPLES={Config.N_SAMPLES})")
+                print(f"  Skipping pass@{k} (k={k} > N_SAMPLES={Config.N_SAMPLES})")
                 continue
                 
             total_pass_prob = 0.0
             
+            # Calculate pass probability for designs with test results
             for result in valid_results:
                 n = result["n_samples"]
                 c = result["simulation_passed"]
@@ -648,13 +680,19 @@ class MultiDatasetHDLTester:
                 pass_prob = Config.calculate_pass_at_k(n, c, k)
                 total_pass_prob += pass_prob
             
-            # Use the correct denominator (total expected designs, not just tested ones)
-            avg_pass_prob = total_pass_prob / max(1, total_designs_for_calculation)
+            # Note: Designs with no generated files have pass_prob = 0
+            # They don't contribute to total_pass_prob, but they ARE counted in the denominator
+            
+            # Use correct denominator (total expected designs)
+            avg_pass_prob = total_pass_prob / max(1, total_expected_designs)
             pass_at_k[f"pass@{k}"] = avg_pass_prob * 100
+            
+            print(f"  pass@{k}: {avg_pass_prob * 100:.2f}% (sum={total_pass_prob:.2f}, denom={total_expected_designs})")
         
         self.results["pass_at_k"] = pass_at_k
         self.results["total_expected_designs"] = total_expected_designs
         self.results["total_tested_designs"] = len(design_trials)
+        self.results["total_valid_results"] = len(valid_results)
         
         # Aggregate statistics
         total_samples = sum(r["n_samples"] for r in valid_results)
@@ -663,8 +701,9 @@ class MultiDatasetHDLTester:
         
         aggregate_stats = {
             "total_designs": len(valid_results),
-            "total_expected_designs": total_expected_designs,  # Added
-            "total_tested_designs": len(design_trials),  # Added
+            "total_expected_designs": total_expected_designs,
+            "total_tested_designs": len(design_trials),
+            "designs_with_no_files": total_expected_designs - len(valid_results),
             "total_samples": total_samples,
             "syntax_success_rate": total_syntax / max(1, total_samples) * 100,
             "simulation_success_rate": total_sim / max(1, total_syntax) * 100 if total_syntax > 0 else 0,
@@ -694,9 +733,29 @@ class MultiDatasetHDLTester:
             if cpp_validation_analysis:
                 self.results["cpp_validation_analysis"] = cpp_validation_analysis
         
-        # Save results
-        with open(self.result_dir / "detailed_results.json", 'w') as f:
-            json.dump(self.results, f, indent=2)
+        # Save detailed results with error handling
+        detailed_results_file = self.result_dir / "detailed_results.json"
+        try:
+            with open(detailed_results_file, 'w', encoding='utf-8') as f:
+                json.dump(self.results, f, indent=2)
+        except PermissionError as e:
+            print(f"\n✗ Permission denied saving detailed results: {e}")
+        except OSError as e:
+            print(f"\n✗ OS error saving detailed results: {e}")
+        except Exception as e:
+            print(f"\n✗ Error saving detailed results: {e}")
+            # Try to save simplified version
+            try:
+                simplified_results = {
+                    "pass_at_k": self.results.get("pass_at_k", {}),
+                    "aggregate_stats": self.results.get("aggregate_stats", {}),
+                    "error": f"Full results failed to save: {e}"
+                }
+                with open(detailed_results_file, 'w', encoding='utf-8') as f:
+                    json.dump(simplified_results, f, indent=2)
+                print(f"  Saved simplified results instead")
+            except:
+                print(f"  Failed to save any results")
         
         summary = {
             "model": self.model_name,
@@ -731,18 +790,24 @@ class MultiDatasetHDLTester:
                 "fix_effectiveness": cpp_validation_analysis.get("fix_effectiveness", 0)
             }
         
-        with open(self.result_dir / "results.json", 'w') as f:
-            json.dump(summary, f, indent=2)
+        # Save summary with error handling
+        summary_file = self.result_dir / "results.json"
+        try:
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=2)
+        except Exception as e:
+            print(f"\n✗ Error saving results summary: {e}")
         
-        # *** MODIFIED: Enhanced output with correct information ***
+        # Print results
         print(f"\nQwen2.5 {self.dataset.upper()} Benchmark Results ({self.temp_mode}):")
         print(f"  Model: {self.model_name}")
         for k in Config.K_VALUES:
-            if f"pass@{k}" in pass_at_k:  # Check if this k was calculated
+            if f"pass@{k}" in pass_at_k:
                 print(f"  pass@{k}: {pass_at_k[f'pass@{k}']:.1f}%")
         if total_expected_designs:
             print(f"  Total expected designs: {total_expected_designs}")
         print(f"  Designs tested: {len(design_trials)}")
+        print(f"  Designs with no files: {aggregate_stats['designs_with_no_files']}")
         print(f"  Syntax rate: {aggregate_stats['syntax_success_rate']:.1f}%")
         print(f"  Simulation rate: {aggregate_stats['simulation_success_rate']:.1f}%")
         print(f"  Designs with any success: {aggregate_stats['designs_with_success']}")
