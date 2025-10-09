@@ -55,9 +55,41 @@ class EnhancedMoAHDLGenerator:
         
         # MoA-specific LLM parameters
         self.moa_llm_params = {
-            "qwen2.5:7b": {"context_length": 65536, "num_predict": 4096, "timeout": 120},
-            "qwen2.5-coder:7b": {"context_length": 65536, "num_predict": 4096, "timeout": 120},
-            "llama3.1:8b": {"context_length": 32768, "num_predict": 4096, "timeout": 120}
+            "qwen2.5:7b": {
+                "context_length": 65536, 
+                "num_predict": 4096, 
+                "timeout": 120
+            },
+            "qwen2.5:14b": {
+                "context_length": 65536, 
+                "num_predict": 4096, 
+                "timeout": 150
+            },
+            "qwen2.5:32b": {
+                "context_length": 128000, 
+                "num_predict": 6144, 
+                "timeout": 180
+            },
+            "qwen2.5-coder:7b": {
+                "context_length": 65536, 
+                "num_predict": 4096, 
+                "timeout": 120
+            },
+            "qwen2.5-coder:14b": {
+                "context_length": 65536, 
+                "num_predict": 4096, 
+                "timeout": 150
+            },
+            "qwen2.5-coder:32b": {
+                "context_length": 128000, 
+                "num_predict": 6144, 
+                "timeout": 200
+            },
+            "llama3.1:8b": {
+                "context_length": 32768, 
+                "num_predict": 4096, 
+                "timeout": 120
+            }
         }
         
         # Initialize LLM interfaces
@@ -792,10 +824,10 @@ def main():
     import sys
     
     # Default configuration
-    layer_models = ['qwen2.5:7b', 'qwen2.5-coder:7b', 'qwen2.5-coder:7b']
-    # layer_models = ['qwen2.5-coder:7b', 'qwen2.5-coder:7b', 'qwen2.5-coder:7b']
-    aggregator_model = 'qwen2.5-coder:7b'
-    num_layers =  4
+    layer_models = ['qwen2.5-coder:14b', 'qwen2.5-coder:14b', 'qwen2.5-coder:14b']
+    # layer_models = ['qwen2.5:14b', 'qwen2.5:14b', 'qwen2.5:14b']
+    aggregator_model = 'qwen2.5-coder:14b'
+    num_layers =  3
     dataset = 'rtllm'
     temp_mode = 'high_T'
     enable_quality_caching = True

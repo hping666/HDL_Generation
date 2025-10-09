@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi-Dataset Generator with iterative refinement support, temperature settings, prescreening and C++ validation
-Supports both RTLLM (Verilog .v files) and VerilogEval (SystemVerilog .sv files)
+Multi-Dataset Generator with enhanced prompt strategies and code extraction
+Supports iterative refinement, prescreening, and C++ validation
 """
 
 import os
@@ -74,11 +74,21 @@ class MultiDatasetGenerator:
         self.file_extension = Config.get_file_extension(dataset)
         self.module_name_required = "TopModule" if dataset == "verilogeval" else None
         
-        # Stage-specific system prompts with dataset awareness
+        # Enhanced stage-specific system prompts (MoA-inspired)
         if self.dataset == "verilogeval":
-            rtl_prompt = "You are a professional SystemVerilog RTL designer. Generate syntactically correct, synthesizable SystemVerilog code following best practices for digital design."
+            rtl_prompt = (
+                "You are a professional SystemVerilog RTL designer. "
+                "Generate syntactically correct, synthesizable SystemVerilog code following best practices. "
+                "Output ONLY the SystemVerilog code starting with 'module' and ending with 'endmodule'. "
+                "Do NOT include any markdown formatting, explanations, or comments outside the module."
+            )
         else:
-            rtl_prompt = "You are a professional Verilog RTL designer. Generate syntactically correct, synthesizable Verilog code following best practices for digital design."
+            rtl_prompt = (
+                "You are a professional Verilog RTL designer. "
+                "Generate syntactically correct, synthesizable Verilog code following best practices. "
+                "Output ONLY the Verilog code starting with 'module' and ending with 'endmodule'. "
+                "Do NOT include any markdown formatting or explanations."
+            )
         
         self.system_prompts = {
             "analyzer": "You are a hardware architecture analyst specializing in digital design. Extract and structure technical requirements from RTL specifications with precision.",
@@ -149,39 +159,45 @@ class MultiDatasetGenerator:
         return '\n'.join(cleaned_lines) if cleaned_lines else code
     
     def generate_verilogeval_prompt(self, prompt_text: str) -> str:
-        """Generate enhanced prompt for VerilogEval ensuring TopModule name and SystemVerilog syntax"""
-        enhanced = f"""Generate ONLY the complete SystemVerilog module code.
+        """Generate enhanced prompt for VerilogEval with strong format requirements"""
+        enhanced = f"""Generate SystemVerilog code for this specification.
 
 CRITICAL REQUIREMENTS:
-- Module MUST be named "TopModule" exactly
-- Write syntactically correct and synthesizable SystemVerilog code
-- Include all necessary logic for the specified functionality  
-- Use proper signal declarations and assignments
-- End with 'endmodule'
-- Do not include explanations, comments, or additional text
+1. Output ONLY the module code
+2. Module name MUST be exactly 'TopModule'
+3. Use modern SystemVerilog port declaration style
+4. Start directly with: module TopModule
+5. End with: endmodule
+6. NO markdown formatting (no ```)
+7. NO explanations or comments outside the module
 
 Task Specification:
 {prompt_text}
 
-Provide the complete TopModule SystemVerilog implementation:"""
+OUTPUT THE SYSTEMVERILOG MODULE CODE NOW (nothing else):"""
         
         return enhanced
     
     def enhance_prompt_for_rtllm(self, description: str) -> str:
-        """Enhanced prompt for RTLLM direct Verilog generation"""
-        enhanced = f"""Generate ONLY the complete Verilog module code.
+        """Enhanced prompt for RTLLM with strong format requirements"""
+        module_name_match = re.search(r'Module name:\s*(\w+)', description)
+        module_name = module_name_match.group(1) if module_name_match else "module_name"
+        
+        enhanced = f"""Generate Verilog code for this specification.
 
-Requirements:
-- Write syntactically correct and synthesizable Verilog code
-- Include all necessary logic for the specified functionality  
-- Use proper signal declarations and assignments
-- End with 'endmodule'
-- Do not include explanations, comments, or additional text
+CRITICAL REQUIREMENTS:
+1. Output ONLY the complete module code
+2. Module name should be: {module_name}
+3. Start directly with: module {module_name}
+4. End with: endmodule
+5. NO markdown formatting (no ```)
+6. NO explanations before or after the code
+7. Do NOT add any text outside the module
 
 Design Specification:
 {description}
 
-Provide the complete Verilog module:"""
+OUTPUT THE VERILOG MODULE CODE NOW (nothing else):"""
         
         return enhanced
     
@@ -223,15 +239,24 @@ Provide complete HLS-compatible C++ implementation:"""
         return prompt
     
     def generate_verilog_from_cpp(self, cpp_code: str, analysis: str) -> str:
-        """Generate Verilog from C++ code and analysis"""
+        """Generate Verilog from C++ code and analysis with strong format requirements"""
         if self.dataset == "verilogeval":
             module_instruction = "CRITICAL: The module MUST be named 'TopModule' exactly.\n"
+            language = "SystemVerilog"
         else:
             module_instruction = ""
+            language = "Verilog"
         
-        prompt = f"""Convert this HLS C++ implementation to synthesizable {'SystemVerilog' if self.dataset == 'verilogeval' else 'Verilog'} RTL.
+        prompt = f"""Convert this HLS C++ implementation to synthesizable {language} RTL.
 
-{module_instruction}Mapping rules:
+{module_instruction}CRITICAL OUTPUT REQUIREMENTS:
+1. Output ONLY the module code
+2. NO markdown formatting (no ```)
+3. NO explanations before or after the code
+4. Start directly with: module <name>
+5. End with: endmodule
+
+Mapping rules:
 - C++ loops map to sequential logic with proper clock/reset
 - C++ arrays map to register arrays or memory blocks
 - C++ if-else maps to Verilog conditional assignments or always blocks
@@ -244,7 +269,7 @@ Technical Requirements:
 C++ Implementation:
 {cpp_code}
 
-Generate complete synthesizable {'SystemVerilog' if self.dataset == 'verilogeval' else 'Verilog'} module (no explanations, just code):"""
+OUTPUT THE {language.upper()} MODULE CODE NOW (nothing else):"""
         
         return prompt
     
@@ -310,47 +335,63 @@ Generate complete synthesizable {'SystemVerilog' if self.dataset == 'verilogeval
         return code, generation_info
     
     def generate_single_trial_direct_with_info(self, description: str, design: Dict = None) -> Tuple[Optional[str], Optional[Dict]]:
-        """Generate single trial using direct method with refinement info"""
-        response = self.llm.generate_response(description, self.system_prompts["rtl_designer"])
+        """Generate single trial using direct method with enhanced prompt and retry"""
+        # Enhance prompt based on dataset
+        if self.dataset == "verilogeval":
+            enhanced_prompt = self.generate_verilogeval_prompt(description)
+        else:
+            enhanced_prompt = self.enhance_prompt_for_rtllm(description)
         
-        if response:
-            initial_verilog = self.llm.extract_verilog(response)
+        # Try twice with increasingly forceful prompts
+        for attempt in range(2):
+            if attempt > 0:
+                # Second attempt - add even stronger reminder
+                retry_prompt = enhanced_prompt + "\n\nREMINDER: Output ONLY the code, NO explanations, NO markdown!"
+                response = self.llm.generate_response(retry_prompt, self.system_prompts["rtl_designer"])
+            else:
+                response = self.llm.generate_response(enhanced_prompt, self.system_prompts["rtl_designer"])
             
-            # Apply refinement if enabled and initial code exists
-            if initial_verilog and self.refiner and design:
-                # Get testbench path based on dataset
-                if self.dataset == "verilogeval":
-                    testbench_result = self.refiner.find_testbench(design['name'])
-                    if isinstance(testbench_result, tuple) and testbench_result[0]:
-                        testbench_path = testbench_result  # Pass tuple for VerilogEval
-                    else:
-                        testbench_path = None
-                else:
-                    testbench_path = self.refiner.find_testbench(design['name'])
-                    if isinstance(testbench_path, tuple):
-                        testbench_path = testbench_path[0]  # Extract single path for RTLLM
+            if response:
+                # Use enhanced extraction with dataset parameter
+                initial_verilog = self.llm.extract_verilog(response, self.dataset)
                 
-                if testbench_path:
-                    # First test the initial code
-                    test_result = self.refiner.test_verilog(initial_verilog, testbench_path)
+                if initial_verilog:
+                    # Apply refinement if enabled and initial code exists
+                    if self.refiner and design:
+                        # Get testbench path based on dataset
+                        if self.dataset == "verilogeval":
+                            testbench_result = self.refiner.find_testbench(design['name'])
+                            if isinstance(testbench_result, tuple) and testbench_result[0]:
+                                testbench_path = testbench_result  # Pass tuple for VerilogEval
+                            else:
+                                testbench_path = None
+                        else:
+                            testbench_path = self.refiner.find_testbench(design['name'])
+                            if isinstance(testbench_path, tuple):
+                                testbench_path = testbench_path[0]  # Extract single path for RTLLM
+                        
+                        if testbench_path:
+                            # First test the initial code
+                            test_result = self.refiner.test_verilog(initial_verilog, testbench_path)
+                            
+                            # Only refine if it failed
+                            if not test_result['passed']:
+                                refined_verilog, refinement_info = self.refiner.refine_verilog(
+                                    initial_verilog, 
+                                    testbench_path,
+                                    description
+                                )
+                                return refined_verilog, refinement_info
+                            else:
+                                # Already passes, no need to refine
+                                return initial_verilog, None
                     
-                    # Only refine if it failed
-                    if not test_result['passed']:
-                        refined_verilog, refinement_info = self.refiner.refine_verilog(
-                            initial_verilog, 
-                            testbench_path,
-                            description
-                        )
-                        return refined_verilog, refinement_info
-                    else:
-                        # Already passes, no need to refine
-                        return initial_verilog, None
-            
-            return initial_verilog, None
+                    return initial_verilog, None
+        
         return None, None
     
     def generate_single_trial_cpp_chain_with_info(self, description: str, design: Dict = None) -> Tuple[Optional[str], Dict]:
-        """Generate single trial using C++ chain method with refinement and C++ validation info"""
+        """Generate single trial using C++ chain method with enhanced prompts and refinement"""
         info_dict = {
             'refinement_info': None,
             'cpp_validation_info': None
@@ -388,82 +429,90 @@ Generate complete synthesizable {'SystemVerilog' if self.dataset == 'verilogeval
         self.last_analysis = analysis_response
         self.last_description = description
         
-        # Stage 3: Generate Verilog from C++ and analysis
-        verilog_prompt = self.generate_verilog_from_cpp(cpp_code, analysis_response)
-        verilog_response = self.llm.generate_response(verilog_prompt, self.system_prompts["rtl_designer"])
-        
-        if verilog_response:
-            initial_verilog = self.llm.extract_verilog(verilog_response)
+        # Stage 3: Generate Verilog from C++ with enhanced prompt and retry
+        for attempt in range(2):
+            verilog_prompt = self.generate_verilog_from_cpp(cpp_code, analysis_response)
             
-            # Apply refinement if enabled and initial code exists
-            if initial_verilog and self.refiner and design:
-                # Get testbench path based on dataset
-                if self.dataset == "verilogeval":
-                    testbench_result = self.refiner.find_testbench(design['name'])
-                    if isinstance(testbench_result, tuple) and testbench_result[0]:
-                        testbench_path = testbench_result  # Pass tuple for VerilogEval
-                    else:
-                        testbench_path = None
-                else:
-                    testbench_path = self.refiner.find_testbench(design['name'])
-                    if isinstance(testbench_path, tuple):
-                        testbench_path = testbench_path[0]  # Extract single path for RTLLM
+            if attempt > 0:
+                verilog_prompt += "\n\nCRITICAL: Output ONLY the module code! NO markdown, NO explanations!"
+            
+            verilog_response = self.llm.generate_response(verilog_prompt, self.system_prompts["rtl_designer"])
+            
+            if verilog_response:
+                # Use enhanced extraction with dataset parameter
+                initial_verilog = self.llm.extract_verilog(verilog_response, self.dataset)
                 
-                if testbench_path:
-                    # First test the initial code
-                    test_result = self.refiner.test_verilog(initial_verilog, testbench_path)
-                    
-                    # If failed, consider C++ validation in "on_failure" mode
-                    if not test_result['passed'] and test_result.get('stage') == 'simulation':
-                        if self.cpp_validator and Config.CPP_VALIDATION_MODE == "on_failure":
-                            # Check if we should fix C++ instead
-                            cpp_check = self.cpp_validator.should_fix_cpp(
-                                test_result.get('errors', []),
-                                self.last_cpp_code,
-                                self.last_description
-                            )
+                if initial_verilog:
+                    # Apply refinement if enabled and initial code exists
+                    if self.refiner and design:
+                        # Get testbench path based on dataset
+                        if self.dataset == "verilogeval":
+                            testbench_result = self.refiner.find_testbench(design['name'])
+                            if isinstance(testbench_result, tuple) and testbench_result[0]:
+                                testbench_path = testbench_result  # Pass tuple for VerilogEval
+                            else:
+                                testbench_path = None
+                        else:
+                            testbench_path = self.refiner.find_testbench(design['name'])
+                            if isinstance(testbench_path, tuple):
+                                testbench_path = testbench_path[0]  # Extract single path for RTLLM
+                        
+                        if testbench_path:
+                            # First test the initial code
+                            test_result = self.refiner.test_verilog(initial_verilog, testbench_path)
                             
-                            if cpp_check['fix_cpp']:
-                                # Fix C++ and regenerate
-                                print(" [CPP-FIX]", end="", flush=True)
-                                refined_cpp, cpp_val_info = self.cpp_validator.validate_and_refine_cpp(
-                                    self.last_cpp_code,
-                                    self.last_description,
-                                    test_result.get('errors', [])
-                                )
-                                
-                                self.cpp_validation_summary['total_validations'] += 1
-                                if cpp_val_info.get('success'):
-                                    self.cpp_validation_summary['successful_validations'] += 1
-                                    self.cpp_validation_summary['cpp_fixes_applied'] += 1
-                                    
-                                    # Regenerate Verilog from fixed C++
-                                    new_verilog_prompt = self.generate_verilog_from_cpp(refined_cpp, self.last_analysis)
-                                    new_verilog_response = self.llm.generate_response(
-                                        new_verilog_prompt,
-                                        self.system_prompts["rtl_designer"]
+                            # If failed, consider C++ validation in "on_failure" mode
+                            if not test_result['passed'] and test_result.get('stage') == 'simulation':
+                                if self.cpp_validator and Config.CPP_VALIDATION_MODE == "on_failure":
+                                    # Check if we should fix C++ instead
+                                    cpp_check = self.cpp_validator.should_fix_cpp(
+                                        test_result.get('errors', []),
+                                        self.last_cpp_code,
+                                        self.last_description
                                     )
                                     
-                                    if new_verilog_response:
-                                        new_verilog = self.llm.extract_verilog(new_verilog_response)
-                                        if new_verilog:
-                                            info_dict['cpp_validation_info'] = cpp_val_info
-                                            return new_verilog, info_dict
+                                    if cpp_check['fix_cpp']:
+                                        # Fix C++ and regenerate
+                                        print(" [CPP-FIX]", end="", flush=True)
+                                        refined_cpp, cpp_val_info = self.cpp_validator.validate_and_refine_cpp(
+                                            self.last_cpp_code,
+                                            self.last_description,
+                                            test_result.get('errors', [])
+                                        )
+                                        
+                                        self.cpp_validation_summary['total_validations'] += 1
+                                        if cpp_val_info.get('success'):
+                                            self.cpp_validation_summary['successful_validations'] += 1
+                                            self.cpp_validation_summary['cpp_fixes_applied'] += 1
+                                            
+                                            # Regenerate Verilog from fixed C++
+                                            new_verilog_prompt = self.generate_verilog_from_cpp(refined_cpp, self.last_analysis)
+                                            new_verilog_response = self.llm.generate_response(
+                                                new_verilog_prompt,
+                                                self.system_prompts["rtl_designer"]
+                                            )
+                                            
+                                            if new_verilog_response:
+                                                new_verilog = self.llm.extract_verilog(new_verilog_response, self.dataset)
+                                                if new_verilog:
+                                                    info_dict['cpp_validation_info'] = cpp_val_info
+                                                    return new_verilog, info_dict
+                            
+                            # Standard Verilog refinement if C++ is OK or not checked
+                            if not test_result['passed']:
+                                refined_verilog, refinement_info = self.refiner.refine_verilog(
+                                    initial_verilog,
+                                    testbench_path,
+                                    description
+                                )
+                                info_dict['refinement_info'] = refinement_info
+                                return refined_verilog, info_dict
+                            else:
+                                # Already passes, no need to refine
+                                return initial_verilog, info_dict
                     
-                    # Standard Verilog refinement if C++ is OK or not checked
-                    if not test_result['passed']:
-                        refined_verilog, refinement_info = self.refiner.refine_verilog(
-                            initial_verilog,
-                            testbench_path,
-                            description
-                        )
-                        info_dict['refinement_info'] = refinement_info
-                        return refined_verilog, info_dict
-                    else:
-                        # Already passes, no need to refine
-                        return initial_verilog, info_dict
-            
-            return initial_verilog, info_dict
+                    return initial_verilog, info_dict
+        
         return None, info_dict
     
     def generate_design_trials(self, design: Dict) -> Dict:
