@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 LLM Interface optimized for Qwen2.5 series with enhanced code extraction
+Now supports OpenAI GPT-4o API
 """
 
 import subprocess
@@ -309,3 +310,145 @@ class OllamaInterface:
                 return code
         
         return response if response else None
+
+
+# NEW: OpenAI Interface class for GPT-4o
+class OpenAIInterface:
+    """
+    OpenAI API interface for GPT-4o and other OpenAI models
+    Compatible with OllamaInterface for seamless integration
+    """
+    def __init__(self, model_name: str, temp_mode: str = "low_T", api_key: str = None):
+        self.model_name = model_name
+        self.temp_mode = temp_mode
+        self.params = Config.get_model_params(model_name, temp_mode)
+        self.api_key = api_key or Config.OPENAI_API_KEY
+        self.base_url = Config.OPENAI_BASE_URL
+        
+        if not self.api_key:
+            raise ValueError("OpenAI API key not provided. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
+    
+    def update_temperature_mode(self, temp_mode: str):
+        """Update temperature mode and refresh parameters"""
+        self.temp_mode = temp_mode
+        self.params = Config.get_model_params(self.model_name, temp_mode)
+    
+    def test_connection(self) -> bool:
+        """Test OpenAI API connection"""
+        try:
+            import requests
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            response = requests.get(f"{self.base_url}/models", headers=headers, timeout=10)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def generate_response(self, prompt: str, system_role: str = None) -> Optional[str]:
+        """Generate response using OpenAI API with retry logic"""
+        try:
+            import requests
+            
+            # Use provided system role or dataset-specific default
+            if system_role is None:
+                if "systemverilog" in prompt.lower():
+                    system_role = "You are a professional SystemVerilog designer. Provide clean, functional SystemVerilog code without explanations."
+                else:
+                    system_role = "You are a professional Verilog designer. Provide clean, functional Verilog code without explanations."
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            # Build messages in OpenAI format
+            messages = [
+                {"role": "system", "content": system_role},
+                {"role": "user", "content": prompt}
+            ]
+            
+            # Map parameters to OpenAI format
+            api_request = {
+                "model": self.model_name,
+                "messages": messages,
+                "temperature": self.params["temperature"],
+                "top_p": self.params["top_p"],
+                "max_tokens": self.params["num_predict"],  # Map num_predict to max_tokens
+                "stream": False
+            }
+            
+            # Retry logic for rate limits
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json=api_request,
+                        timeout=self.params["timeout"]
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        return content.strip()
+                    elif response.status_code == 429:  # Rate limit
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt  # Exponential backoff
+                            print(f"  Rate limited, waiting {wait_time}s...", flush=True)
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            print(f"  Rate limit exceeded after {max_retries} retries", flush=True)
+                            return None
+                    else:
+                        print(f"  OpenAI API error: {response.status_code}", flush=True)
+                        return None
+                        
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries - 1:
+                        print(f"  Timeout, retrying... ({attempt + 1}/{max_retries})", flush=True)
+                        continue
+                    else:
+                        return None
+                        
+        except ImportError:
+            print("Error: 'requests' library not installed. Install with: pip install requests")
+            return None
+        except Exception as e:
+            print(f"  OpenAI API exception: {str(e)}", flush=True)
+            return None
+        
+        return None
+    
+    # Reuse code extraction methods from OllamaInterface
+    def extract_verilog(self, response: str, dataset: str = "rtllm") -> Optional[str]:
+        """Reuse OllamaInterface's extraction logic"""
+        dummy_interface = OllamaInterface("dummy", "low_T")
+        return dummy_interface.extract_verilog(response, dataset)
+    
+    def extract_cpp_code(self, response: str) -> Optional[str]:
+        """Reuse OllamaInterface's C++ extraction logic"""
+        dummy_interface = OllamaInterface("dummy", "low_T")
+        return dummy_interface.extract_cpp_code(response)
+
+
+# NEW: Factory function to create appropriate interface
+def create_llm_interface(model_name: str, temp_mode: str = "low_T", api_key: str = None):
+    """
+    Factory function to create appropriate LLM interface based on model name
+    
+    Args:
+        model_name: Name of the model (e.g., "qwen2.5:14b" or "gpt-4o")
+        temp_mode: Temperature mode ("low_T" or "high_T")
+        api_key: Optional API key for OpenAI models
+    
+    Returns:
+        OllamaInterface or OpenAIInterface instance
+    """
+    if Config.is_openai_model(model_name):
+        return OpenAIInterface(model_name, temp_mode, api_key)
+    else:
+        return OllamaInterface(model_name, temp_mode)

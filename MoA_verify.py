@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Union
 from datetime import datetime
 from config import Config
-from llm_interface import OllamaInterface
+from llm_interface import create_llm_interface
 from hdl_tester_enhanced import MultiDatasetHDLTester
 from utils import load_designs
 from quality_evaluator import HDLQualityEvaluator
@@ -97,11 +97,15 @@ class EnhancedMoAHDLGenerator:
         all_models = [aggregator_model] if num_layers == 0 else list(set(layer_models + [aggregator_model]))
         
         for model in all_models:
-            llm = OllamaInterface(model, temp_mode)
+            # Use factory function to create appropriate interface
+            llm = create_llm_interface(model, temp_mode)
+            
+            # Apply MoA-specific parameters if defined
             if model in self.moa_llm_params:
                 base_params = Config.get_model_params(model, temp_mode)
                 base_params.update(self.moa_llm_params[model])
                 llm.params = base_params
+            
             self.llm_interfaces[model] = llm
         
         # Set file extension and language
@@ -824,10 +828,11 @@ def main():
     import sys
     
     # Default configuration
-    layer_models = ['qwen2.5-coder:14b', 'qwen2.5-coder:14b', 'qwen2.5-coder:14b']
+    layer_models = ['gpt-4o-mini', 'gpt-4o-mini', 'gpt-4o-mini']
+    # layer_models = ['gpt-4o', 'gpt-4o', 'gpt-4o']
     # layer_models = ['qwen2.5:14b', 'qwen2.5:14b', 'qwen2.5:14b']
-    aggregator_model = 'qwen2.5-coder:14b'
-    num_layers =  3
+    aggregator_model = 'gpt-4o-mini'
+    num_layers =  2
     dataset = 'rtllm'
     temp_mode = 'high_T'
     enable_quality_caching = True

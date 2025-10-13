@@ -5,6 +5,7 @@ Configuration for RTLLM (Verilog) and VerilogEval (SystemVerilog) Benchmark Test
 
 from pathlib import Path
 import math
+import os
 
 class Config:
     # Qwen2.5 models - optimized for coding tasks
@@ -14,6 +15,16 @@ class Config:
         # "qwen2.5:32b",
         # "qwen2.5:72b"
     ]
+    
+    # OpenAI models - NEW: Added GPT-4o support
+    OPENAI_MODELS = [
+        "gpt-4o",
+        "gpt-4o-mini",
+    ]
+    
+    # OpenAI API Configuration - NEW
+    OPENAI_API_KEY = "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"  # Set via environment or modify here
+    OPENAI_BASE_URL = "https://api.openai.com/v1"  # Can be changed for proxy/alternative endpoints
     
     # Supported datasets
     DATASET_TYPES = ["rtllm", "verilogeval"]
@@ -92,6 +103,17 @@ class Config:
             "context_length": 128000,
             "num_predict": 4096,     # Most tokens for best model
             "timeout": 240
+        },
+        # NEW: OpenAI GPT-4o parameters
+        "gpt-4o": {
+            "context_length": 128000,
+            "num_predict": 4096,
+            "timeout": 120
+        },
+        "gpt-4o-mini": {
+            "context_length": 128000,
+            "num_predict": 4096,
+            "timeout": 90
         }
     }
     
@@ -120,10 +142,15 @@ class Config:
         return base_params
     
     @classmethod
+    def is_openai_model(cls, model_name: str) -> bool:
+        """NEW: Check if model is an OpenAI model"""
+        return model_name in cls.OPENAI_MODELS
+    
+    @classmethod
     def get_folder_name(cls, model_name: str, method: str = "direct", 
                        temp_mode: str = "low_T", dataset: str = "rtllm") -> str:
         """Get folder name for model, method, temperature and dataset combination"""
-        base_name = model_name.replace(":", "_").replace(".", "_")
+        base_name = model_name.replace(":", "_").replace(".", "_").replace("-", "_")  # Modified: handle GPT model names
         suffix_parts = []
         
         if method != "direct":

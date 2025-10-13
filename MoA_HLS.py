@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-MoA_HLS.py - Multi-path MoA with Direct, C++ Chain, and Python Chain
-Implements a hybrid approach combining direct generation with intermediate 
-code representations (C++ and Python) to enhance HDL generation quality.
+MoA_HLS.py - Multi-path MoA with Configurable Intermediate Agents
+Implements a hybrid approach with configurable paths (direct, C++, Python) per layer.
 Uses dual-layer caching: HDL quality evaluation + intermediate code preservation.
 """
 
@@ -14,7 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from config import Config
-from llm_interface import OllamaInterface
+from llm_interface import create_llm_interface
 from hdl_tester_enhanced import MultiDatasetHDLTester
 from utils import load_designs
 from quality_evaluator import HDLQualityEvaluator
@@ -122,13 +121,13 @@ class DualLayerCacheManager(HDLCacheManager):
 
 class MoAHLSGenerator:
     """
-    Multi-path MoA Generator with Direct, C++, and Python chains
+    Multi-path MoA Generator with Configurable Intermediate Agents
     All paths use the same LLM model
     """
     
     def __init__(self, model: str, num_layers: int, dataset: str = "rtllm",
                  temp_mode: str = "low_T", enable_quality_caching: bool = True,
-                 n_select: int = 3):
+                 n_select: int = 3, path_config: List[str] = None):
         """
         Initialize MoA-HLS Generator
         
@@ -139,6 +138,10 @@ class MoAHLSGenerator:
             temp_mode: 'low_T' or 'high_T'
             enable_quality_caching: Whether to use quality-based caching
             n_select: Number of top codes to select per layer
+            path_config: List of path types for each MoA layer
+                        e.g., ['direct', 'cpp', 'python'] or ['cpp', 'cpp', 'cpp']
+                        Valid values: 'direct', 'cpp', 'python'
+                        Default: ['direct', 'cpp', 'python']
         """
         self.model = model
         self.num_layers = num_layers
@@ -146,6 +149,17 @@ class MoAHLSGenerator:
         self.temp_mode = temp_mode
         self.enable_quality_caching = enable_quality_caching
         self.n_select = n_select
+        
+        # Configure paths for MoA layers
+        if path_config is None:
+            self.path_config = ['direct', 'cpp', 'python']  # Default configuration
+        else:
+            # Validate path configuration
+            valid_paths = {'direct', 'cpp', 'python'}
+            for path in path_config:
+                if path not in valid_paths:
+                    raise ValueError(f"Invalid path type: {path}. Must be one of {valid_paths}")
+            self.path_config = path_config
         
         # Dataset-specific paths
         self.dataset_dir = Config.VERILOGEVAL_DIR if dataset == "verilogeval" else Config.RTLLM_DIR
@@ -156,8 +170,8 @@ class MoAHLSGenerator:
         else:
             self.quality_evaluator = None
         
-        # Initialize LLM interface
-        self.llm = OllamaInterface(model, temp_mode)
+        # Initialize LLM interface - Modified: Support both Ollama and OpenAI models
+        self.llm = create_llm_interface(model, temp_mode)
         
         # Apply extended context for MoA
         moa_params = {
@@ -190,11 +204,15 @@ class MoAHLSGenerator:
         """Setup output directories with descriptive folder names"""
         model_str = self.model.replace(":", "-").replace(".", "_")
         
+        # Generate path configuration string for folder name
+        path_str = "_".join(self.path_config)
+        
         folder_parts = [
             "MoA_HLS",
             self.temp_mode,
             f"L{self.num_layers}",
-            model_str
+            model_str,
+            f"paths_{path_str}"  # Add path configuration to folder name
         ]
         
         if self.enable_quality_caching:
@@ -224,7 +242,8 @@ class MoAHLSGenerator:
             base_cache_dir = Path("./verilog_temp")
         
         model_str = self.model.replace(":", "-").replace(".", "_")
-        folder_name = f"MoA_HLS_{self.temp_mode}_L{self.num_layers}_{model_str}_QCache_N{self.n_select}"
+        path_str = "_".join(self.path_config)
+        folder_name = f"MoA_HLS_{self.temp_mode}_L{self.num_layers}_{model_str}_paths_{path_str}_QCache_N{self.n_select}"
         
         self.cache_dir = base_cache_dir / "MoA_HLS" / folder_name
         self.global_cache_manager = GlobalCacheManager(self.cache_dir)
@@ -627,11 +646,79 @@ Generate the {self.language} module implementing this logic:"""
         
         return None, python_code
     
+    def generate_single_path(self, path_type: str, description: str, design_name: str,
+                            previous_hdl: List[Dict] = None,
+                            reference_cpp: Optional[str] = None,
+                            reference_python: Optional[str] = None) -> Optional[Dict]:
+        """
+        Generate HDL via a single path
+        
+        Args:
+            path_type: 'direct', 'cpp', or 'python'
+            description: Design specification
+            design_name: Name of the design
+            previous_hdl: Previous layer HDL codes
+            reference_cpp: Reference C++ code (if available)
+            reference_python: Reference Python code (if available)
+        
+        Returns:
+            Dict with HDL code, quality score, path type, and optional intermediate code
+        """
+        hdl_code = None
+        intermediate_code = None
+        intermediate_language = None
+        
+        if path_type == 'direct':
+            print("D", end="", flush=True)
+            hdl_code = self.generate_path_direct(description, previous_hdl)
+            
+        elif path_type == 'cpp':
+            print("C", end="", flush=True)
+            hdl_code, intermediate_code = self.generate_path_cpp_chain(
+                description, previous_hdl, reference_cpp
+            )
+            intermediate_language = "cpp"
+            
+        elif path_type == 'python':
+            print("P", end="", flush=True)
+            hdl_code, intermediate_code = self.generate_path_python_chain(
+                description, previous_hdl, reference_python
+            )
+            intermediate_language = "python"
+        
+        else:
+            raise ValueError(f"Unknown path type: {path_type}")
+        
+        # Validate and evaluate HDL code
+        if hdl_code and self.validate_hdl_code(hdl_code):
+            quality = 0.0
+            if self.enable_quality_caching:
+                quality = self.quality_evaluator.evaluate_quality(hdl_code, design_name)
+            
+            result = {
+                "code": hdl_code,
+                "quality_score": quality,
+                "path": f"{path_type}_chain" if path_type != 'direct' else 'direct',
+                "model": self.model,
+                "intermediate": None
+            }
+            
+            # Add intermediate code if available
+            if intermediate_code and intermediate_language:
+                result["intermediate"] = {
+                    "language": intermediate_language,
+                    "code": intermediate_code
+                }
+            
+            return result
+        
+        return None
+    
     def generate_multipath_layer(self, description: str, layer_idx: int,
                                  design_name: str, cache_manager: Optional[DualLayerCacheManager] = None,
                                  previous_codes: List[Dict] = None) -> List[Dict]:
         """
-        Generate HDL via 3 paths using same LLM
+        Generate HDL via configured paths using same LLM
         
         Returns: List of dicts with HDL code, quality score, path, and optional intermediate code
         """
@@ -651,62 +738,19 @@ Generate the {self.language} module implementing this logic:"""
             if best_python:
                 reference_python = best_python["code"]
         
-        # Path 1: Direct
-        print("D", end="", flush=True)
-        direct_hdl = self.generate_path_direct(description, previous_codes)
-        
-        if direct_hdl and self.validate_hdl_code(direct_hdl):
-            quality = 0.0
-            if self.enable_quality_caching:
-                quality = self.quality_evaluator.evaluate_quality(direct_hdl, design_name)
+        # Generate HDL for each configured path
+        for path_type in self.path_config:
+            result = self.generate_single_path(
+                path_type=path_type,
+                description=description,
+                design_name=design_name,
+                previous_hdl=previous_codes,
+                reference_cpp=reference_cpp,
+                reference_python=reference_python
+            )
             
-            layer_outputs.append({
-                "code": direct_hdl,
-                "quality_score": quality,
-                "path": "direct",
-                "model": self.model,
-                "intermediate": None
-            })
-        
-        # Path 2: C++ chain
-        print("C", end="", flush=True)
-        cpp_hdl, cpp_code = self.generate_path_cpp_chain(description, previous_codes, reference_cpp)
-        
-        if cpp_hdl and self.validate_hdl_code(cpp_hdl):
-            quality = 0.0
-            if self.enable_quality_caching:
-                quality = self.quality_evaluator.evaluate_quality(cpp_hdl, design_name)
-            
-            layer_outputs.append({
-                "code": cpp_hdl,
-                "quality_score": quality,
-                "path": "cpp_chain",
-                "model": self.model,
-                "intermediate": {
-                    "language": "cpp",
-                    "code": cpp_code
-                } if cpp_code else None
-            })
-        
-        # Path 3: Python chain
-        print("P", end="", flush=True)
-        py_hdl, py_code = self.generate_path_python_chain(description, previous_codes, reference_python)
-        
-        if py_hdl and self.validate_hdl_code(py_hdl):
-            quality = 0.0
-            if self.enable_quality_caching:
-                quality = self.quality_evaluator.evaluate_quality(py_hdl, design_name)
-            
-            layer_outputs.append({
-                "code": py_hdl,
-                "quality_score": quality,
-                "path": "python_chain",
-                "model": self.model,
-                "intermediate": {
-                    "language": "python",
-                    "code": py_code
-                } if py_code else None
-            })
+            if result:
+                layer_outputs.append(result)
         
         return layer_outputs
     
@@ -754,7 +798,7 @@ Generate the {self.language} module implementing this logic:"""
             if self.enable_quality_caching and current_layer_outputs:
                 cache_manager.add_layer_outputs_with_intermediate(layer_idx, current_layer_outputs)
         
-        # ===== Final aggregation phase =====
+        # Final aggregation phase
         print(" AGG", end="", flush=True)
         
         if self.enable_quality_caching and cache_manager:
@@ -762,9 +806,9 @@ Generate the {self.language} module implementing this logic:"""
             final_input = cache_manager.get_top_quality_codes(self.n_select)
             
             if final_input:
-                # Generate final aggregation prompt (NO intermediate code)
+                # Generate final aggregation prompt (no intermediate code)
                 final_prompt = self.generate_aggregation_prompt(
-                    final_input, description, intermediate_code=None  # ← 明确传None
+                    final_input, description, intermediate_code=None
                 )
                 
                 # LLM performs final aggregation
@@ -879,12 +923,12 @@ Generate the {self.language} module implementing this logic:"""
     
     def run_generation(self, designs: List[Dict]):
         """Run MoA-HLS generation for all designs"""
-        print("MoA-HLS: Multi-path HDL Generation")
+        print("MoA-HLS: Multi-path HDL Generation with Configurable Agents")
         print(f"Dataset: {self.dataset} ({self.language})")
         print(f"Model: {self.model}")
         print(f"Temperature: {self.temp_mode}")
         print(f"Layers: {self.num_layers}")
-        print(f"Paths: Direct, C++ Chain, Python Chain")
+        print(f"Path Configuration: {self.path_config} ({len(self.path_config)} paths per layer)")
         
         if self.enable_quality_caching:
             print(f"Quality caching: Enabled (select top-{self.n_select} per layer)")
@@ -912,7 +956,8 @@ Generate the {self.language} module implementing this logic:"""
             "language": self.language,
             "temp_mode": self.temp_mode,
             "num_layers": self.num_layers,
-            "paths": ["direct", "cpp_chain", "python_chain"],
+            "path_config": self.path_config,
+            "num_paths_per_layer": len(self.path_config),
             "quality_caching": self.enable_quality_caching,
             "n_select": self.n_select if self.enable_quality_caching else None,
             "cache_directory": str(self.cache_dir) if self.enable_quality_caching else None,
@@ -941,7 +986,7 @@ Generate the {self.language} module implementing this logic:"""
     
     def run_testing(self):
         """Run testing on generated files"""
-        model_name = f"MoA_HLS_{self.model.replace(':', '-')}_L{self.num_layers}"
+        model_name = f"MoA_HLS_{self.model.replace(':', '-')}_L{self.num_layers}_paths_{'_'.join(self.path_config)}"
         
         tester = MultiDatasetHDLTester(
             self.verilog_dir,
@@ -961,12 +1006,13 @@ def main():
     import sys
     
     # Default configuration
-    model = 'qwen2.5:14b'
+    model = 'qwen2.5-coder:14b'
     num_layers = 3
     dataset = 'rtllm'
     temp_mode = 'high_T'
     enable_quality_caching = True
     n_select = 3
+    path_config = None  # None Will use default ['direct', 'cpp', 'python']
     
     # Parse command line arguments
     for arg in sys.argv[1:]:
@@ -980,20 +1026,28 @@ def main():
             temp_mode = arg.split('=')[1]
         elif arg.startswith('--n_select='):
             n_select = int(arg.split('=')[1])
+        elif arg.startswith('--paths='):
+            # Parse path configuration, e.g., --paths=cpp,cpp,cpp or --paths=direct,python
+            path_config = arg.split('=')[1].split(',')
         elif arg in ['--no_cache', '--no-cache']:
             enable_quality_caching = False
         elif arg == '--help':
-            print("MoA-HLS: Multi-path HDL Generation")
+            print("MoA-HLS: Multi-path HDL Generation with Configurable Agents")
             print("\nUsage: python MoA_HLS.py [options]")
             print("\nOptions:")
-            print("  --model=<name>       LLM model (default: qwen2.5-coder:7b)")
-            print("  --layers=<n>         Number of layers (default: 4)")
+            print("  --model=<name>       LLM model (default: qwen2.5:14b)")
+            print("  --layers=<n>         Number of layers (default: 3)")
             print("  --dataset=<name>     Dataset: rtllm|verilogeval (default: rtllm)")
             print("  --temp=<mode>        Temperature: low_T|high_T (default: high_T)")
             print("  --n_select=<n>       Top-n selection per layer (default: 3)")
+            print("  --paths=<config>     Path configuration (default: direct,cpp,python)")
+            print("                       Examples:")
+            print("                         --paths=cpp,cpp,cpp       (3 C++ paths)")
+            print("                         --paths=python,python     (2 Python paths)")
+            print("                         --paths=direct,cpp        (direct + C++)")
             print("  --no_cache           Disable quality caching")
             print("\nExample:")
-            print("  python MoA_HLS.py --model=qwen2.5-coder:7b --layers=4 --dataset=rtllm --temp=high_T")
+            print("  python MoA_HLS.py --model=qwen2.5:14b --layers=3 --paths=cpp,cpp,cpp")
             return
     
     # Load designs
@@ -1011,7 +1065,8 @@ def main():
         dataset=dataset,
         temp_mode=temp_mode,
         enable_quality_caching=enable_quality_caching,
-        n_select=n_select
+        n_select=n_select,
+        path_config=path_config
     )
     
     # Run generation
