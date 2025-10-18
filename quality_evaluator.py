@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Quality Evaluator for HDL code using iverilog syntax and function testing with severity-weighted scoring
+Enhanced with error type identification and detailed error extraction for self-refinement
 """
 
 import subprocess
@@ -43,6 +44,73 @@ class HDLQualityEvaluator:
             # Syntax passes but function fails - severity-weighted evaluation
             return self._severity_weighted_evaluation(code)
     
+    def evaluate_quality_with_details(self, code: str, design_name: str) -> Tuple[float, Dict]:
+        """
+        Evaluate HDL code quality and return detailed error information for refinement
+        
+        Returns:
+            Tuple of (quality_score, error_details)
+            
+        error_details = {
+            "passed": bool,
+            "syntax_passed": bool,
+            "function_passed": bool,
+            "error_type": str,  # "syntax_error", "compilation_error", "simulation_fail", or None
+            "error_message": str,  # Raw error message from iverilog/vvp
+            "stderr": str,
+            "stdout": str
+        }
+        """
+        error_details = {
+            "passed": False,
+            "syntax_passed": False,
+            "function_passed": False,
+            "error_type": None,
+            "error_message": "",
+            "stderr": "",
+            "stdout": ""
+        }
+        
+        if not code or not code.strip():
+            error_details["error_type"] = "syntax_error"
+            error_details["error_message"] = "Empty or invalid code"
+            return 0.0, error_details
+        
+        # Step 1: Syntax test with details
+        syntax_score, syntax_stderr = self._test_syntax_with_details(code)
+        
+        if syntax_score == 0.0:
+            error_details["syntax_passed"] = False
+            error_details["error_type"] = "syntax_error"
+            error_details["error_message"] = syntax_stderr
+            error_details["stderr"] = syntax_stderr
+            return self._fallback_evaluation(code), error_details
+        
+        error_details["syntax_passed"] = True
+        
+        # Step 2: Function test with details
+        function_score, func_stdout, func_stderr, compilation_failed = self._test_function_with_details(code, design_name)
+        
+        if function_score > 0.0:
+            # Both pass
+            error_details["passed"] = True
+            error_details["function_passed"] = True
+            return 1.0, error_details
+        else:
+            # Syntax passes but function fails
+            error_details["function_passed"] = False
+            error_details["stdout"] = func_stdout
+            error_details["stderr"] = func_stderr
+            
+            if compilation_failed:
+                error_details["error_type"] = "compilation_error"
+                error_details["error_message"] = func_stderr
+            else:
+                error_details["error_type"] = "simulation_fail"
+                error_details["error_message"] = func_stdout + "\n" + func_stderr
+            
+            return self._severity_weighted_evaluation(code), error_details
+    
     def _test_syntax(self, code: str) -> float:
         """Test syntax using iverilog compilation"""
         try:
@@ -69,6 +137,35 @@ class HDLQualityEvaluator:
             
         except Exception:
             return 0.0
+    
+    def _test_syntax_with_details(self, code: str) -> Tuple[float, str]:
+        """Test syntax and return error details"""
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix=self.file_extension, delete=False) as f:
+                f.write(code)
+                temp_file = f.name
+            
+            temp_out = f"/tmp/syntax_test_{int(time.time())}.out"
+            
+            syntax_cmd = ["iverilog", "-g2012", "-o", temp_out, temp_file]
+            result = subprocess.run(syntax_cmd, capture_output=True, text=True, 
+                                  timeout=Config.COMPILATION_TIMEOUT)
+            
+            # Cleanup
+            try:
+                os.unlink(temp_file)
+                if os.path.exists(temp_out):
+                    os.unlink(temp_out)
+            except:
+                pass
+            
+            if result.returncode == 0:
+                return 1.0, ""
+            else:
+                return 0.0, result.stderr
+            
+        except Exception as e:
+            return 0.0, str(e)
     
     def _test_function(self, code: str, design_name: str) -> float:
         """Test function using iverilog + testbench simulation"""
@@ -123,6 +220,69 @@ class HDLQualityEvaluator:
             
         except Exception:
             return 0.0
+    
+    def _test_function_with_details(self, code: str, design_name: str) -> Tuple[float, str, str, bool]:
+        """
+        Test function and return detailed results
+        
+        Returns:
+            (score, stdout, stderr, compilation_failed)
+        """
+        try:
+            testbench_result = self._find_testbench(design_name)
+            if isinstance(testbench_result, tuple):
+                testbench, ref_file = testbench_result
+            else:
+                testbench, ref_file = testbench_result, None
+                
+            if not testbench:
+                return 0.0, "", "No testbench found", True
+            
+            if self.dataset == "verilogeval" and not ref_file:
+                return 0.0, "", "No reference file found", True
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix=self.file_extension, delete=False) as f:
+                f.write(code)
+                code_file = f.name
+            
+            temp_out = f"/tmp/func_test_{int(time.time())}.out"
+            
+            # Compilation with testbench
+            if self.dataset == "verilogeval" and ref_file:
+                compile_cmd = ["iverilog", "-g2012", "-o", temp_out, str(testbench), code_file, str(ref_file)]
+            else:
+                compile_cmd = ["iverilog", "-g2012", "-o", temp_out, str(testbench), code_file]
+            
+            compile_result = subprocess.run(compile_cmd, capture_output=True, text=True, 
+                                          timeout=Config.COMPILATION_TIMEOUT)
+            
+            if compile_result.returncode != 0:
+                # Compilation failed
+                try:
+                    os.unlink(code_file)
+                except:
+                    pass
+                return 0.0, compile_result.stdout, compile_result.stderr, True
+            
+            # Simulation
+            sim_cmd = ["vvp", temp_out]
+            sim_result = subprocess.run(sim_cmd, capture_output=True, text=True, 
+                                      timeout=Config.SIMULATION_TIMEOUT)
+            
+            # Cleanup
+            try:
+                os.unlink(code_file)
+                if os.path.exists(temp_out):
+                    os.unlink(temp_out)
+            except:
+                pass
+            
+            # Parse simulation results
+            success = self._parse_simulation_result(sim_result.stdout, sim_result.stderr)
+            return (1.0 if success else 0.0), sim_result.stdout, sim_result.stderr, False
+            
+        except Exception as e:
+            return 0.0, "", str(e), True
     
     def _severity_weighted_evaluation(self, code: str) -> float:
         """

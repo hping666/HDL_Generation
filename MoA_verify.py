@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-MoA_verify.py - Enhanced Mixture-of-Agents HDL generation with quality-based caching
+MoA_verify.py - Enhanced Mixture-of-Agents HDL generation with quality-based caching and early stopping
 Implements quality evaluation and caching mechanism to improve MoA performance with increasing layers
 Enhanced with robust code extraction and quality-based layer input selection
+NEW: Added early stopping feature to terminate generation when perfect HDL is found
+NEW: Added self-refinement feature to iteratively fix HDL errors using iverilog feedback
 """
 
 import json
@@ -22,9 +24,10 @@ from cache_manager import HDLCacheManager, GlobalCacheManager
 class EnhancedMoAHDLGenerator:
     def __init__(self, layer_models: List[str], aggregator_model: str, 
                  num_layers: int, dataset: str = "rtllm", temp_mode: str = "low_T", 
-                 enable_quality_caching: bool = False):
+                 enable_quality_caching: bool = False, enable_early_stopping: bool = False,
+                 enable_self_refinement: bool = False, max_self_refinement_iterations: int = 3):
         """
-        Initialize Enhanced MoA HDL Generator with optional quality-based caching
+        Initialize Enhanced MoA HDL Generator with optional quality-based caching, early stopping and self-refinement
         
         Args:
             layer_models: List of models for each layer
@@ -33,6 +36,9 @@ class EnhancedMoAHDLGenerator:
             dataset: 'rtllm' or 'verilogeval'
             temp_mode: 'low_T' or 'high_T'
             enable_quality_caching: True for ResNet-style quality caching, False for standard MoA
+            enable_early_stopping: True to stop generation when perfect HDL (score=1.0) is found
+            enable_self_refinement: True to iteratively fix HDL errors using iverilog feedback
+            max_self_refinement_iterations: Maximum refinement iterations (default: 3)
         """
         self.layer_models = layer_models
         self.aggregator_model = aggregator_model
@@ -40,6 +46,11 @@ class EnhancedMoAHDLGenerator:
         self.dataset = dataset
         self.temp_mode = temp_mode
         self.enable_quality_caching = enable_quality_caching
+        self.enable_early_stopping = enable_early_stopping
+        self.enable_self_refinement = enable_self_refinement
+        
+        # Self-refinement parameters (only effective when quality caching is enabled)
+        self.max_self_refinement_iterations = max_self_refinement_iterations
         
         # Quality-based caching parameters
         self.n_select = 3  # Number of top-quality codes to select for next layer input
@@ -52,6 +63,10 @@ class EnhancedMoAHDLGenerator:
             self.quality_evaluator = HDLQualityEvaluator(dataset_dir, dataset)
         else:
             self.quality_evaluator = None
+            # Disable self-refinement if quality caching is disabled
+            if self.enable_self_refinement:
+                print("Warning: Self-refinement requires quality caching. Disabling self-refinement.")
+                self.enable_self_refinement = False
         
         # MoA-specific LLM parameters
         self.moa_llm_params = {
@@ -136,6 +151,10 @@ class EnhancedMoAHDLGenerator:
             folder_name = f"MoA_{self.temp_mode}_L{self.num_layers}_{models_str}_AGG_{aggregator_str}"
             if self.enable_quality_caching:
                 folder_name += "_QualityCache"
+            if self.enable_early_stopping:
+                folder_name += "_EarlyStop"
+            if self.enable_self_refinement:
+                folder_name += f"_SelfRef{self.max_self_refinement_iterations}"
         
         if self.dataset == "verilogeval":
             self.verilog_dir = Path("./verilog_eval/MoA") / folder_name
@@ -164,6 +183,10 @@ class EnhancedMoAHDLGenerator:
             models_str = "_".join([m.replace(":", "-").replace(".", "_") for m in self.layer_models])
             aggregator_str = self.aggregator_model.replace(":", "-").replace(".", "_")
             folder_name = f"MoA_{self.temp_mode}_L{self.num_layers}_{models_str}_AGG_{aggregator_str}_QualityCache"
+            if self.enable_early_stopping:
+                folder_name += "_EarlyStop"
+            if self.enable_self_refinement:
+                folder_name += f"_SelfRef{self.max_self_refinement_iterations}"
         
         self.cache_dir = base_cache_dir / "MoA" / folder_name
         self.global_cache_manager = GlobalCacheManager(self.cache_dir)
@@ -189,6 +212,12 @@ class EnhancedMoAHDLGenerator:
                 "Output ONLY the SystemVerilog code starting with 'module TopModule' and ending with 'endmodule'. "
                 "Do NOT include any markdown formatting or explanations."
             )
+            self.system_prompt_refinement = (
+                "You are an expert SystemVerilog debugger. "
+                "Your task is to analyze compilation/simulation errors and fix them precisely. "
+                "Focus on the specific error messages and fix ONLY what's broken. "
+                "Output clean, corrected code without explanations."
+            )
         else:  # rtllm
             self.system_prompt_generate = (
                 "You are a professional Verilog RTL designer. "
@@ -202,6 +231,211 @@ class EnhancedMoAHDLGenerator:
                 "Output ONLY the Verilog code starting with 'module' and ending with 'endmodule'. "
                 "Do NOT include any markdown formatting or explanations."
             )
+            self.system_prompt_refinement = (
+                "You are an expert Verilog debugger. "
+                "Your task is to analyze compilation/simulation errors and fix them precisely. "
+                "Focus on the specific error messages and fix ONLY what's broken. "
+                "Output clean, corrected code without explanations."
+            )
+    
+    def generate_refinement_prompt(self, original_code: str, error_type: str, 
+                                   error_message: str, description: str, iteration: int) -> str:
+        """
+        Generate refinement prompt based on error type and iteration
+        
+        Args:
+            original_code: The HDL code that failed
+            error_type: 'syntax_error', 'compilation_error', or 'simulation_fail'
+            error_message: Error message from iverilog/vvp
+            description: Original design specification
+            iteration: Current refinement iteration (1-based)
+        """
+        # Base context
+        base_context = f"""You are debugging {self.language} code that failed testing.
+
+Original specification:
+{description}
+
+Current code (Refinement attempt {iteration}/{self.max_self_refinement_iterations}):
+{original_code}
+
+Error encountered:
+{error_message}
+"""
+        
+        # Error-specific guidance
+        if error_type == "syntax_error":
+            specific_guidance = """
+SYNTAX ERROR DETECTED. Common issues:
+1. Variable/genvar redeclaration - check all loop variables and ensure unique naming
+2. Part select with non-constant expressions - use parameters or constants
+3. Missing/mismatched module declarations
+4. Incorrect port declarations or signal types
+
+Fix the syntax errors while preserving the original logic.
+"""
+        
+        elif error_type == "compilation_error":
+            # Check for module name mismatch or missing modules
+            if "Unknown module type" in error_message:
+                specific_guidance = """
+MISSING/UNKNOWN MODULE ERROR. Possible causes:
+1. Module name mismatch with testbench expectations
+2. Missing submodule definitions - you must implement ALL modules in a single file
+3. Hierarchical design split incorrectly
+
+Solution:
+- Implement all required submodules in the SAME file
+- Ensure the top-level module name matches the testbench requirement
+- Use inline logic instead of module instantiation if appropriate
+"""
+            else:
+                specific_guidance = """
+COMPILATION ERROR. Check:
+1. Module name matches testbench expectations
+2. Port declarations are correct
+3. All referenced signals are declared
+4. No circular dependencies
+"""
+        
+        elif error_type == "simulation_fail":
+            specific_guidance = """
+SIMULATION FAILURE. The code compiles but produces incorrect results.
+Possible issues:
+1. Logic errors in state machines or combinational logic
+2. Incorrect edge sensitivity (posedge/negedge)
+3. Race conditions or initialization issues
+4. Incorrect bit widths or signal ranges
+
+Review and fix the functional logic while maintaining correct syntax.
+"""
+        
+        else:  # Unknown error type
+            specific_guidance = """
+TESTING FAILED. Review the error message carefully and fix the issue.
+"""
+        
+        # Output requirements (dataset-specific)
+        if self.dataset == "verilogeval":
+            output_requirements = """
+CRITICAL OUTPUT REQUIREMENTS:
+1. Module name MUST be exactly 'TopModule'
+2. Output ONLY the complete, corrected SystemVerilog code
+3. Start with: module TopModule
+4. End with: endmodule
+5. NO markdown formatting (no ```)
+6. NO explanations - only code
+7. Include ALL necessary submodules in the SAME file if needed
+"""
+        else:  # rtllm
+            module_name_match = re.search(r'Module name:\s*(\w+)', description)
+            module_name = module_name_match.group(1) if module_name_match else "module_name"
+            
+            output_requirements = f"""
+CRITICAL OUTPUT REQUIREMENTS:
+1. Module name should be: {module_name}
+2. Output ONLY the complete, corrected Verilog code
+3. Start with: module {module_name}
+4. End with: endmodule
+5. NO markdown formatting (no ```)
+6. NO explanations - only code
+7. Include ALL necessary submodules in the SAME file if needed
+"""
+        
+        # Iteration-specific encouragement
+        if iteration == 1:
+            iteration_note = "This is your first attempt to fix the error. Focus on the specific error message."
+        elif iteration == 2:
+            iteration_note = "Previous fix attempt failed. Try a different approach - the issue might be more fundamental."
+        else:
+            iteration_note = "Multiple fix attempts have failed. Consider simplifying the design or using a completely different implementation approach."
+        
+        return f"""{base_context}
+
+{specific_guidance}
+
+{iteration_note}
+
+{output_requirements}
+
+Output the corrected {self.language} code now:"""
+    
+    def refine_hdl_code(self, original_code: str, design_name: str, description: str, 
+                       model: str) -> Tuple[Optional[str], float, int]:
+        """
+        Iteratively refine HDL code using iverilog feedback
+        
+        Args:
+            original_code: Initial HDL code to refine
+            design_name: Name of the design
+            description: Original design specification
+            model: LLM model to use for refinement
+        
+        Returns:
+            Tuple of (best_code, best_quality, iterations_performed)
+        """
+        if not self.enable_self_refinement or not self.enable_quality_caching:
+            # Self-refinement disabled
+            quality = self.quality_evaluator.evaluate_quality(original_code, design_name)
+            return original_code, quality, 0
+        
+        # Evaluate original code with details
+        quality, error_details = self.quality_evaluator.evaluate_quality_with_details(
+            original_code, design_name
+        )
+        
+        # If already perfect, return immediately
+        if error_details["passed"]:
+            return original_code, quality, 0
+        
+        # Start refinement process
+        best_code = original_code
+        best_quality = quality
+        current_code = original_code
+        
+        llm = self.llm_interfaces[model]
+        
+        for iteration in range(1, self.max_self_refinement_iterations + 1):
+            # Generate refinement prompt
+            refinement_prompt = self.generate_refinement_prompt(
+                current_code,
+                error_details["error_type"],
+                error_details["error_message"],
+                description,
+                iteration
+            )
+            
+            # Get refined code from LLM
+            response = llm.generate_response(refinement_prompt, self.system_prompt_refinement)
+            
+            if not response:
+                break  # LLM failed to respond
+            
+            # Extract code
+            refined_code = self.extract_code(response)
+            
+            if not refined_code or not self.validate_extracted_code(refined_code):
+                break  # Failed to extract valid code
+            
+            # Evaluate refined code
+            refined_quality, refined_error_details = self.quality_evaluator.evaluate_quality_with_details(
+                refined_code, design_name
+            )
+            
+            # Update best code if improved
+            if refined_quality > best_quality:
+                best_code = refined_code
+                best_quality = refined_quality
+            
+            # Check if perfect
+            if refined_error_details["passed"]:
+                return refined_code, refined_quality, iteration
+            
+            # Prepare for next iteration
+            current_code = refined_code
+            error_details = refined_error_details
+        
+        return best_code, best_quality, self.max_self_refinement_iterations if iteration == self.max_self_refinement_iterations else iteration
     
     def generate_initial_prompt(self, description: str) -> str:
         """Generate initial prompt with stronger format requirements"""
@@ -513,6 +747,13 @@ Output the {language_spec} module now:"""
             if response:
                 code = self.extract_code(response)
                 if code and self.validate_extracted_code(code):
+                    # Apply self-refinement if enabled
+                    if self.enable_self_refinement:
+                        code, quality, iterations = self.refine_hdl_code(
+                            code, design_name, description, self.aggregator_model
+                        )
+                        if iterations > 0:
+                            print(f"[R{iterations}]", end="", flush=True)
                     print(" OK")
                     return code
         
@@ -520,7 +761,11 @@ Output the {language_spec} module now:"""
         return None
     
     def generate_moa_trial(self, description: str, trial_num: int, design_name: str) -> Optional[str]:
-        """Generate single trial using MoA methodology (unified for both modes)"""
+        """
+        Generate single trial using MoA methodology (unified for both modes)
+        NEW: Supports early stopping when perfect HDL is found
+        NEW: Supports self-refinement for intermediate and final HDL
+        """
         if self.num_layers == 0:
             return self.generate_direct_trial(description, trial_num, design_name)
         
@@ -534,6 +779,10 @@ Output the {language_spec} module now:"""
         
         initial_prompt = self.generate_initial_prompt(description)
         layer_outputs = []  # For standard mode
+        
+        # Early stopping flag
+        perfect_code_found = None
+        early_stop_layer = None
         
         # Process each layer
         for layer_idx in range(self.num_layers):
@@ -550,8 +799,14 @@ Output the {language_spec} module now:"""
                         code = self.extract_code(response)
                         if code and self.validate_extracted_code(code):
                             if self.enable_quality_caching:
-                                # Quality caching mode: evaluate and store
-                                quality_score = self.quality_evaluator.evaluate_quality(code, design_name)
+                                # Quality caching mode: evaluate and optionally refine
+                                if self.enable_self_refinement:
+                                    code, quality_score, refine_iters = self.refine_hdl_code(
+                                        code, design_name, description, model
+                                    )
+                                else:
+                                    quality_score = self.quality_evaluator.evaluate_quality(code, design_name)
+                                
                                 hdl_output = {
                                     "code": code,
                                     "model": model,
@@ -563,6 +818,12 @@ Output the {language_spec} module now:"""
                                     }
                                 }
                                 current_layer_outputs.append(hdl_output)
+                                
+                                # Check for perfect code (early stopping)
+                                if self.enable_early_stopping and quality_score == 1.0 and perfect_code_found is None:
+                                    perfect_code_found = code
+                                    early_stop_layer = layer_idx
+                                    print(f"[PERFECT@L{layer_idx+1}]", end="", flush=True)
                             else:
                                 # Standard mode: just collect code
                                 current_layer_outputs.append(code)
@@ -574,7 +835,13 @@ Output the {language_spec} module now:"""
                                 code = self.extract_code(response)
                                 if code and self.validate_extracted_code(code):
                                     if self.enable_quality_caching:
-                                        quality_score = self.quality_evaluator.evaluate_quality(code, design_name)
+                                        if self.enable_self_refinement:
+                                            code, quality_score, refine_iters = self.refine_hdl_code(
+                                                code, design_name, description, model
+                                            )
+                                        else:
+                                            quality_score = self.quality_evaluator.evaluate_quality(code, design_name)
+                                        
                                         hdl_output = {
                                             "code": code,
                                             "model": model,
@@ -586,6 +853,11 @@ Output the {language_spec} module now:"""
                                             }
                                         }
                                         current_layer_outputs.append(hdl_output)
+                                        
+                                        if self.enable_early_stopping and quality_score == 1.0 and perfect_code_found is None:
+                                            perfect_code_found = code
+                                            early_stop_layer = layer_idx
+                                            print(f"[PERFECT@L{layer_idx+1}]", end="", flush=True)
                                     else:
                                         current_layer_outputs.append(code)
                 
@@ -596,6 +868,11 @@ Output the {language_spec} module now:"""
                 else:
                     # Standard mode: store outputs for next layer
                     layer_outputs = current_layer_outputs
+                
+                # Early stopping check after Layer 0
+                if self.enable_early_stopping and perfect_code_found is not None:
+                    print(f" EARLY_STOP")
+                    return perfect_code_found
             
             else:
                 # Subsequent layers
@@ -626,7 +903,13 @@ Output the {language_spec} module now:"""
                         code = self.extract_code(response)
                         if code and self.validate_extracted_code(code):
                             if self.enable_quality_caching:
-                                quality_score = self.quality_evaluator.evaluate_quality(code, design_name)
+                                if self.enable_self_refinement:
+                                    code, quality_score, refine_iters = self.refine_hdl_code(
+                                        code, design_name, description, model
+                                    )
+                                else:
+                                    quality_score = self.quality_evaluator.evaluate_quality(code, design_name)
+                                
                                 hdl_output = {
                                     "code": code,
                                     "model": model,
@@ -639,6 +922,11 @@ Output the {language_spec} module now:"""
                                     }
                                 }
                                 current_layer_outputs.append(hdl_output)
+                                
+                                if self.enable_early_stopping and quality_score == 1.0 and perfect_code_found is None:
+                                    perfect_code_found = code
+                                    early_stop_layer = layer_idx
+                                    print(f"[PERFECT@L{layer_idx+1}]", end="", flush=True)
                             else:
                                 current_layer_outputs.append(code)
                 
@@ -647,11 +935,16 @@ Output the {language_spec} module now:"""
                         cache_manager.add_layer_outputs(layer_idx, current_layer_outputs)
                 else:
                     layer_outputs = current_layer_outputs
+                
+                # Early stopping check after each subsequent layer
+                if self.enable_early_stopping and perfect_code_found is not None:
+                    print(f" EARLY_STOP")
+                    return perfect_code_found
             
             output_count = len(current_layer_outputs)
             print(f"({output_count})", end="", flush=True)
         
-        # Final aggregation
+        # Final aggregation (only if early stopping didn't trigger)
         print(" AGG", end="", flush=True)
         
         if self.enable_quality_caching:
@@ -674,6 +967,13 @@ Output the {language_spec} module now:"""
                 if response:
                     final_code = self.extract_code(response)
                     if final_code and self.validate_extracted_code(final_code):
+                        # Apply self-refinement to final code if enabled
+                        if self.enable_self_refinement:
+                            final_code, final_quality, refine_iters = self.refine_hdl_code(
+                                final_code, design_name, description, self.aggregator_model
+                            )
+                            if refine_iters > 0:
+                                print(f"[R{refine_iters}]", end="", flush=True)
                         print(" OK")
                         return final_code
             
@@ -711,7 +1011,9 @@ Output the {language_spec} module now:"""
                 try:
                     with open(trial_file, 'w') as f:
                         f.write(code)
-                    trials.append({"trial": trial_num, "file": str(trial_file), "success": True})
+                    
+                    trial_info = {"trial": trial_num, "file": str(trial_file), "success": True}
+                    trials.append(trial_info)
                     successful_count += 1
                 except Exception as e:
                     trials.append({"trial": trial_num, "error": str(e), "success": False})
@@ -740,6 +1042,18 @@ Output the {language_spec} module now:"""
         else:
             print("Standard MoA HDL Generation")
             method = "Standard_MoA"
+        
+        # Print early stopping status
+        if self.enable_early_stopping:
+            print("✓ Early Stopping: ENABLED (will stop when perfect HDL found)")
+        else:
+            print("✗ Early Stopping: DISABLED")
+        
+        # Print self-refinement status
+        if self.enable_self_refinement:
+            print(f"✓ Self-Refinement: ENABLED (max {self.max_self_refinement_iterations} iterations)")
+        else:
+            print("✗ Self-Refinement: DISABLED")
         
         print(f"Dataset: {self.dataset} ({self.language})")
         print(f"Temperature: {self.temp_mode}")
@@ -779,6 +1093,9 @@ Output the {language_spec} module now:"""
             "layer_models": self.layer_models if self.num_layers > 0 else [],
             "aggregator_model": self.aggregator_model,
             "quality_based_caching": self.enable_quality_caching,
+            "early_stopping_enabled": self.enable_early_stopping,
+            "self_refinement_enabled": self.enable_self_refinement,
+            "max_self_refinement_iterations": self.max_self_refinement_iterations if self.enable_self_refinement else None,
             "n_select_per_layer": self.n_select if self.enable_quality_caching else None,
             "cache_directory": str(self.cache_dir) if self.enable_quality_caching else None,
             "timestamp": datetime.now().isoformat(),
@@ -814,6 +1131,10 @@ Output the {language_spec} module now:"""
             model_name = f"Direct_{self.aggregator_model.replace(':', '-')}"
         else:
             model_name = f"{'Enhanced' if self.enable_quality_caching else 'Standard'}_MoA_{self.num_layers}L"
+            if self.enable_early_stopping:
+                model_name += "_EarlyStop"
+            if self.enable_self_refinement:
+                model_name += f"_SelfRef{self.max_self_refinement_iterations}"
         
         tester = MultiDatasetHDLTester(
             self.verilog_dir, dataset_dir, self.result_dir,
@@ -828,14 +1149,15 @@ def main():
     import sys
     
     # Default configuration
-    layer_models = ['gpt-4o-mini', 'gpt-4o-mini', 'gpt-4o-mini']
-    # layer_models = ['gpt-4o', 'gpt-4o', 'gpt-4o']
-    # layer_models = ['qwen2.5:14b', 'qwen2.5:14b', 'qwen2.5:14b']
-    aggregator_model = 'gpt-4o-mini'
-    num_layers =  2
+    layer_models = ['qwen2.5-coder:7b', 'qwen2.5-coder:7b', 'qwen2.5-coder:7b']
+    aggregator_model = 'qwen2.5-coder:7b'
+    num_layers = 2
     dataset = 'rtllm'
     temp_mode = 'high_T'
     enable_quality_caching = True
+    enable_early_stopping = False
+    enable_self_refinement = False  
+    max_self_refinement_iterations = 3  
     
     # Parse command line arguments
     for arg in sys.argv[1:]:
@@ -854,6 +1176,18 @@ def main():
             enable_quality_caching = arg.split('=')[1].lower() in ['true', '1', 'yes', 'on']
         elif arg == '--quality_cache':
             enable_quality_caching = True
+        elif arg.startswith('--early_stop='):
+            enable_early_stopping = arg.split('=')[1].lower() in ['true', '1', 'yes', 'on']
+        elif arg == '--early_stop':
+            enable_early_stopping = True
+        elif arg.startswith('--self_refine='):
+            enable_self_refinement = arg.split('=')[1].lower() in ['true', '1', 'yes', 'on']
+        elif arg == '--self_refine':
+            enable_self_refinement = True
+        elif arg == '--no_self_refine':
+            enable_self_refinement = False
+        elif arg.startswith('--max_refine_iters='):
+            max_self_refinement_iterations = int(arg.split('=')[1])
     
     # Load designs
     designs = load_designs(dataset)
@@ -870,7 +1204,10 @@ def main():
         num_layers=num_layers,
         dataset=dataset,
         temp_mode=temp_mode,
-        enable_quality_caching=enable_quality_caching
+        enable_quality_caching=enable_quality_caching,
+        enable_early_stopping=enable_early_stopping,
+        enable_self_refinement=enable_self_refinement,
+        max_self_refinement_iterations=max_self_refinement_iterations
     )
     
     # Run generation

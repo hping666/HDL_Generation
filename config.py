@@ -23,7 +23,7 @@ class Config:
     ]
     
     # OpenAI API Configuration - NEW
-    OPENAI_API_KEY = "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"  # Set via environment or modify here
+    OPENAI_API_KEY = ""  # Set via environment or modify here
     OPENAI_BASE_URL = "https://api.openai.com/v1"  # Can be changed for proxy/alternative endpoints
     
     # Supported datasets

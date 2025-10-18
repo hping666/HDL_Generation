@@ -3,6 +3,8 @@
 MoA_HLS.py - Multi-path MoA with Configurable Intermediate Agents
 Implements a hybrid approach with configurable paths (direct, C++, Python) per layer.
 Uses dual-layer caching: HDL quality evaluation + intermediate code preservation.
+NEW: Added early stopping feature to terminate generation when perfect HDL is found
+NEW: Added self-refinement feature to iteratively fix HDL errors using iverilog feedback
 """
 
 import json
@@ -46,6 +48,7 @@ class DualLayerCacheManager(HDLCacheManager):
         - quality_score: Quality score
         - path: 'direct', 'cpp_chain', or 'python_chain'
         - intermediate: Dict with 'language' and 'code' (optional)
+        - original_quality: Original quality before refinement (for intermediate code eval)
         """
         layer_key = str(layer_idx)
         
@@ -69,11 +72,14 @@ class DualLayerCacheManager(HDLCacheManager):
                 hdl_entry["has_intermediate"] = True
                 hdl_entry["intermediate_language"] = intermediate["language"]
                 
+                # Use original_quality for intermediate code evaluation (not refined quality)
+                intermediate_quality = hdl_output.get("original_quality", hdl_output["quality_score"])
+                
                 # Store in intermediate codes section with reference to HDL
                 intermediate_entry = {
                     "code": intermediate["code"],
                     "language": intermediate["language"],
-                    "hdl_quality": hdl_output["quality_score"],
+                    "hdl_quality": intermediate_quality,  # Use original quality
                     "layer_idx": layer_idx,
                     "hdl_reference_idx": len(self.cache_data["layer_outputs"][layer_key])
                 }
@@ -127,7 +133,9 @@ class MoAHLSGenerator:
     
     def __init__(self, model: str, num_layers: int, dataset: str = "rtllm",
                  temp_mode: str = "low_T", enable_quality_caching: bool = True,
-                 n_select: int = 3, path_config: List[str] = None):
+                 n_select: int = 3, path_config: List[str] = None,
+                 enable_early_stopping: bool = False, enable_self_refinement: bool = False,
+                 max_self_refinement_iterations: int = 3):
         """
         Initialize MoA-HLS Generator
         
@@ -142,6 +150,9 @@ class MoAHLSGenerator:
                         e.g., ['direct', 'cpp', 'python'] or ['cpp', 'cpp', 'cpp']
                         Valid values: 'direct', 'cpp', 'python'
                         Default: ['direct', 'cpp', 'python']
+            enable_early_stopping: True to stop generation when perfect HDL (score=1.0) is found
+            enable_self_refinement: True to iteratively fix HDL errors using iverilog feedback
+            max_self_refinement_iterations: Maximum refinement iterations (default: 3)
         """
         self.model = model
         self.num_layers = num_layers
@@ -149,6 +160,16 @@ class MoAHLSGenerator:
         self.temp_mode = temp_mode
         self.enable_quality_caching = enable_quality_caching
         self.n_select = n_select
+        self.enable_early_stopping = enable_early_stopping
+        self.enable_self_refinement = enable_self_refinement
+        
+        # Self-refinement parameters (only effective when quality caching is enabled)
+        self.max_self_refinement_iterations = max_self_refinement_iterations
+        
+        # Disable self-refinement if quality caching is disabled
+        if self.enable_self_refinement and not self.enable_quality_caching:
+            print("Warning: Self-refinement requires quality caching. Disabling self-refinement.")
+            self.enable_self_refinement = False
         
         # Configure paths for MoA layers
         if path_config is None:
@@ -212,11 +233,17 @@ class MoAHLSGenerator:
             self.temp_mode,
             f"L{self.num_layers}",
             model_str,
-            f"paths_{path_str}"  # Add path configuration to folder name
+            f"paths_{path_str}"
         ]
         
         if self.enable_quality_caching:
             folder_parts.append(f"QCache_N{self.n_select}")
+        
+        if self.enable_early_stopping:
+            folder_parts.append("EarlyStop")
+        
+        if self.enable_self_refinement:
+            folder_parts.append(f"SelfRef{self.max_self_refinement_iterations}")
         
         folder_name = "_".join(folder_parts)
         
@@ -244,6 +271,12 @@ class MoAHLSGenerator:
         model_str = self.model.replace(":", "-").replace(".", "_")
         path_str = "_".join(self.path_config)
         folder_name = f"MoA_HLS_{self.temp_mode}_L{self.num_layers}_{model_str}_paths_{path_str}_QCache_N{self.n_select}"
+        
+        if self.enable_early_stopping:
+            folder_name += "_EarlyStop"
+        
+        if self.enable_self_refinement:
+            folder_name += f"_SelfRef{self.max_self_refinement_iterations}"
         
         self.cache_dir = base_cache_dir / "MoA_HLS" / folder_name
         self.global_cache_manager = GlobalCacheManager(self.cache_dir)
@@ -275,6 +308,13 @@ class MoAHLSGenerator:
                 "The module MUST be named 'TopModule' exactly. "
                 "Output ONLY the SystemVerilog code. No markdown or explanations."
             )
+            
+            self.system_prompt_refinement = (
+                "You are an expert SystemVerilog debugger. "
+                "Your task is to analyze compilation/simulation errors and fix them precisely. "
+                "Focus on the specific error messages and fix ONLY what's broken. "
+                "Output clean, corrected code without explanations."
+            )
         else:  # rtllm
             self.system_prompt_direct = (
                 "You are a professional Verilog RTL designer. "
@@ -294,6 +334,248 @@ class MoAHLSGenerator:
                 "Translate the reference implementation to synthesizable Verilog. "
                 "Output ONLY the Verilog code. No markdown or explanations."
             )
+            
+            self.system_prompt_refinement = (
+                "You are an expert Verilog debugger. "
+                "Your task is to analyze compilation/simulation errors and fix them precisely. "
+                "Focus on the specific error messages and fix ONLY what's broken. "
+                "Output clean, corrected code without explanations."
+            )
+    
+    def generate_refinement_prompt(self, original_code: str, error_type: str,
+                                   error_message: str, description: str, 
+                                   iteration: int, intermediate_code: Optional[str] = None,
+                                   intermediate_language: Optional[str] = None) -> str:
+        """
+        Generate refinement prompt for HDL code
+        
+        Args:
+            original_code: The HDL code that failed
+            error_type: 'syntax_error', 'compilation_error', or 'simulation_fail'
+            error_message: Error message from iverilog/vvp
+            description: Original design specification
+            iteration: Current refinement iteration (1-based)
+            intermediate_code: Optional intermediate code (for cpp/python paths)
+            intermediate_language: Language of intermediate code ('cpp' or 'python')
+        """
+        # Base context
+        if intermediate_code and intermediate_language:
+            # For HLS paths: include intermediate code reference
+            base_context = f"""You are fixing {self.language} code that was translated from {intermediate_language.upper()}.
+
+Original specification:
+{description}
+
+{intermediate_language.upper()} reference implementation:
+{intermediate_code}
+
+Current {self.language} code (Refinement attempt {iteration}/{self.max_self_refinement_iterations}):
+{original_code}
+
+Error encountered:
+{error_message}
+
+The {intermediate_language.upper()} reference is correct - focus on fixing the {self.language} translation.
+"""
+        else:
+            # For direct path: standard refinement
+            base_context = f"""You are debugging {self.language} code that failed testing.
+
+Original specification:
+{description}
+
+Current code (Refinement attempt {iteration}/{self.max_self_refinement_iterations}):
+{original_code}
+
+Error encountered:
+{error_message}
+"""
+        
+        # Error-specific guidance
+        if error_type == "syntax_error":
+            specific_guidance = """
+SYNTAX ERROR DETECTED. Common issues:
+1. Variable/genvar redeclaration - check all loop variables and ensure unique naming
+2. Part select with non-constant expressions - use parameters or constants
+3. Missing/mismatched module declarations
+4. Incorrect port declarations or signal types
+
+Fix the syntax errors while preserving the original logic.
+"""
+        
+        elif error_type == "compilation_error":
+            if "Unknown module type" in error_message:
+                specific_guidance = """
+MISSING/UNKNOWN MODULE ERROR. Possible causes:
+1. Module name mismatch with testbench expectations
+2. Missing submodule definitions - you must implement ALL modules in a single file
+3. Hierarchical design split incorrectly
+
+Solution:
+- Implement all required submodules in the SAME file
+- Ensure the top-level module name matches the testbench requirement
+- Use inline logic instead of module instantiation if appropriate
+"""
+            else:
+                specific_guidance = """
+COMPILATION ERROR. Check:
+1. Module name matches testbench expectations
+2. Port declarations are correct
+3. All referenced signals are declared
+4. No circular dependencies
+"""
+        
+        elif error_type == "simulation_fail":
+            specific_guidance = """
+SIMULATION FAILURE. The code compiles but produces incorrect results.
+Possible issues:
+1. Logic errors in state machines or combinational logic
+2. Incorrect edge sensitivity (posedge/negedge)
+3. Race conditions or initialization issues
+4. Incorrect bit widths or signal ranges
+
+Review and fix the functional logic while maintaining correct syntax.
+"""
+        
+        else:
+            specific_guidance = """
+TESTING FAILED. Review the error message carefully and fix the issue.
+"""
+        
+        # Add HLS-specific guidance if intermediate code is present
+        if intermediate_code and intermediate_language:
+            specific_guidance += f"""
+Common issues when translating from {intermediate_language.upper()}:
+1. Loop constructs (for/while) → always blocks with proper sensitivity
+2. Arrays/pointers → wire/reg arrays with correct indexing
+3. Functions → modules or combinational logic
+4. Sequential operations → state machines or pipelined logic
+"""
+        
+        # Output requirements
+        if self.dataset == "verilogeval":
+            output_requirements = """
+CRITICAL OUTPUT REQUIREMENTS:
+1. Module name MUST be exactly 'TopModule'
+2. Output ONLY the complete, corrected SystemVerilog code
+3. Start with: module TopModule
+4. End with: endmodule
+5. NO markdown formatting (no ```)
+6. NO explanations - only code
+7. Include ALL necessary submodules in the SAME file if needed
+"""
+        else:
+            module_name_match = re.search(r'Module name:\s*(\w+)', description)
+            module_name = module_name_match.group(1) if module_name_match else "module_name"
+            
+            output_requirements = f"""
+CRITICAL OUTPUT REQUIREMENTS:
+1. Module name should be: {module_name}
+2. Output ONLY the complete, corrected Verilog code
+3. Start with: module {module_name}
+4. End with: endmodule
+5. NO markdown formatting (no ```)
+6. NO explanations - only code
+7. Include ALL necessary submodules in the SAME file if needed
+"""
+        
+        # Iteration-specific encouragement
+        if iteration == 1:
+            iteration_note = "This is your first attempt to fix the error. Focus on the specific error message."
+        elif iteration == 2:
+            iteration_note = "Previous fix attempt failed. Try a different approach - the issue might be more fundamental."
+        else:
+            iteration_note = "Multiple fix attempts have failed. Consider simplifying the design or using a completely different implementation approach."
+        
+        return f"""{base_context}
+
+{specific_guidance}
+
+{iteration_note}
+
+{output_requirements}
+
+Output the corrected {self.language} code now:"""
+    
+    def refine_hdl_code(self, original_code: str, design_name: str, description: str,
+                       intermediate_code: Optional[str] = None,
+                       intermediate_language: Optional[str] = None) -> Tuple[str, float, int, float]:
+        """
+        Iteratively refine HDL code using iverilog feedback
+        
+        Args:
+            original_code: Initial HDL code to refine
+            design_name: Name of the design
+            description: Original design specification
+            intermediate_code: Optional intermediate code (for cpp/python paths)
+            intermediate_language: Language of intermediate code ('cpp' or 'python')
+        
+        Returns:
+            Tuple of (best_code, final_quality, iterations_performed, original_quality)
+        """
+        if not self.enable_self_refinement or not self.enable_quality_caching:
+            # Self-refinement disabled
+            quality = self.quality_evaluator.evaluate_quality(original_code, design_name)
+            return original_code, quality, 0, quality
+        
+        # Evaluate original code with details
+        quality, error_details = self.quality_evaluator.evaluate_quality_with_details(
+            original_code, design_name
+        )
+        original_quality = quality  # Store original quality for intermediate code eval
+        
+        # If already perfect, return immediately
+        if error_details["passed"]:
+            return original_code, quality, 0, original_quality
+        
+        # Start refinement process
+        best_code = original_code
+        best_quality = quality
+        current_code = original_code
+        
+        for iteration in range(1, self.max_self_refinement_iterations + 1):
+            # Generate refinement prompt
+            refinement_prompt = self.generate_refinement_prompt(
+                current_code,
+                error_details["error_type"],
+                error_details["error_message"],
+                description,
+                iteration,
+                intermediate_code,
+                intermediate_language
+            )
+            
+            # Get refined code from LLM
+            response = self.llm.generate_response(refinement_prompt, self.system_prompt_refinement)
+            
+            if not response:
+                break  # LLM failed to respond
+            
+            # Extract code
+            refined_code = self.extract_code(response)
+            
+            if not refined_code or not self.validate_hdl_code(refined_code):
+                break  # Failed to extract valid code
+            
+            # Evaluate refined code
+            refined_quality, refined_error_details = self.quality_evaluator.evaluate_quality_with_details(
+                refined_code, design_name
+            )
+            
+            # Update best code if improved
+            if refined_quality > best_quality:
+                best_code = refined_code
+                best_quality = refined_quality
+            
+            # Check if perfect
+            if refined_error_details["passed"]:
+                return refined_code, refined_quality, iteration, original_quality
+            
+            # Prepare for next iteration
+            current_code = refined_code
+            error_details = refined_error_details
+        
+        return best_code, best_quality, self.max_self_refinement_iterations if iteration == self.max_self_refinement_iterations else iteration, original_quality
     
     def extract_code(self, response: str) -> Optional[str]:
         """Extract HDL code from LLM response - reuse from OllamaInterface"""
@@ -651,7 +933,7 @@ Generate the {self.language} module implementing this logic:"""
                             reference_cpp: Optional[str] = None,
                             reference_python: Optional[str] = None) -> Optional[Dict]:
         """
-        Generate HDL via a single path
+        Generate HDL via a single path with optional self-refinement
         
         Args:
             path_type: 'direct', 'cpp', or 'python'
@@ -662,7 +944,7 @@ Generate the {self.language} module implementing this logic:"""
             reference_python: Reference Python code (if available)
         
         Returns:
-            Dict with HDL code, quality score, path type, and optional intermediate code
+            Dict with HDL code, quality score, path type, optional intermediate code, and original_quality
         """
         hdl_code = None
         intermediate_code = None
@@ -691,13 +973,22 @@ Generate the {self.language} module implementing this logic:"""
         
         # Validate and evaluate HDL code
         if hdl_code and self.validate_hdl_code(hdl_code):
-            quality = 0.0
-            if self.enable_quality_caching:
-                quality = self.quality_evaluator.evaluate_quality(hdl_code, design_name)
+            # Apply self-refinement if enabled
+            if self.enable_self_refinement and self.enable_quality_caching:
+                hdl_code, quality, refine_iters, original_quality = self.refine_hdl_code(
+                    hdl_code, design_name, description, intermediate_code, intermediate_language
+                )
+            else:
+                quality = 0.0
+                original_quality = 0.0
+                if self.enable_quality_caching:
+                    quality = self.quality_evaluator.evaluate_quality(hdl_code, design_name)
+                    original_quality = quality
             
             result = {
                 "code": hdl_code,
                 "quality_score": quality,
+                "original_quality": original_quality,  # For intermediate code evaluation
                 "path": f"{path_type}_chain" if path_type != 'direct' else 'direct',
                 "model": self.model,
                 "intermediate": None
@@ -758,6 +1049,8 @@ Generate the {self.language} module implementing this logic:"""
         """
         Generate single trial with multi-path MoA and final aggregation
         Follows original MoA architecture: layers → top-n selection → final aggregation
+        NEW: Supports early stopping when perfect HDL is found
+        NEW: Supports self-refinement for intermediate and final HDL
         """
         print(f"  Trial {trial_num}: ", end="", flush=True)
         
@@ -766,6 +1059,10 @@ Generate the {self.language} module implementing this logic:"""
             cache_manager = DualLayerCacheManager(self.cache_dir, design_name, trial_num)
         
         current_layer_outputs = []
+        
+        # Early stopping tracking
+        perfect_code_found = None
+        early_stop_layer = None
         
         # Process each layer
         for layer_idx in range(self.num_layers):
@@ -797,6 +1094,20 @@ Generate the {self.language} module implementing this logic:"""
             
             if self.enable_quality_caching and current_layer_outputs:
                 cache_manager.add_layer_outputs_with_intermediate(layer_idx, current_layer_outputs)
+                
+                # Check for perfect code (early stopping)
+                if self.enable_early_stopping and perfect_code_found is None:
+                    for output in current_layer_outputs:
+                        if output["quality_score"] == 1.0:
+                            perfect_code_found = output["code"]
+                            early_stop_layer = layer_idx
+                            print(f"[PERFECT@L{layer_idx+1}]", end="", flush=True)
+                            break
+                    
+                    # Early stopping - terminate if perfect code found
+                    if perfect_code_found is not None:
+                        print(" EARLY_STOP")
+                        return perfect_code_found
         
         # Final aggregation phase
         print(" AGG", end="", flush=True)
@@ -823,6 +1134,13 @@ Generate the {self.language} module implementing this logic:"""
                     if response:
                         final_code = self.extract_code(response)
                         if final_code and self.validate_hdl_code(final_code):
+                            # Apply self-refinement to final code
+                            if self.enable_self_refinement:
+                                final_code, final_quality, refine_iters, _ = self.refine_hdl_code(
+                                    final_code, design_name, description
+                                )
+                                if refine_iters > 0:
+                                    print(f"[R{refine_iters}]", end="", flush=True)
                             print(" OK")
                             return final_code
                 
@@ -930,6 +1248,18 @@ Generate the {self.language} module implementing this logic:"""
         print(f"Layers: {self.num_layers}")
         print(f"Path Configuration: {self.path_config} ({len(self.path_config)} paths per layer)")
         
+        # Print early stopping status
+        if self.enable_early_stopping:
+            print("✓ Early Stopping: ENABLED (will stop when perfect HDL found)")
+        else:
+            print("✗ Early Stopping: DISABLED")
+        
+        # Print self-refinement status
+        if self.enable_self_refinement:
+            print(f"✓ Self-Refinement: ENABLED (max {self.max_self_refinement_iterations} iterations)")
+        else:
+            print("✗ Self-Refinement: DISABLED")
+        
         if self.enable_quality_caching:
             print(f"Quality caching: Enabled (select top-{self.n_select} per layer)")
             print(f"Cache directory: {self.cache_dir}")
@@ -959,6 +1289,9 @@ Generate the {self.language} module implementing this logic:"""
             "path_config": self.path_config,
             "num_paths_per_layer": len(self.path_config),
             "quality_caching": self.enable_quality_caching,
+            "early_stopping_enabled": self.enable_early_stopping,
+            "self_refinement_enabled": self.enable_self_refinement,
+            "max_self_refinement_iterations": self.max_self_refinement_iterations if self.enable_self_refinement else None,
             "n_select": self.n_select if self.enable_quality_caching else None,
             "cache_directory": str(self.cache_dir) if self.enable_quality_caching else None,
             "timestamp": datetime.now().isoformat(),
@@ -988,6 +1321,12 @@ Generate the {self.language} module implementing this logic:"""
         """Run testing on generated files"""
         model_name = f"MoA_HLS_{self.model.replace(':', '-')}_L{self.num_layers}_paths_{'_'.join(self.path_config)}"
         
+        if self.enable_early_stopping:
+            model_name += "_EarlyStop"
+        
+        if self.enable_self_refinement:
+            model_name += f"_SelfRef{self.max_self_refinement_iterations}"
+        
         tester = MultiDatasetHDLTester(
             self.verilog_dir,
             self.dataset_dir,
@@ -1006,13 +1345,16 @@ def main():
     import sys
     
     # Default configuration
-    model = 'qwen2.5-coder:14b'
-    num_layers = 3
+    model = 'gpt-4o-mini'
+    num_layers = 4
     dataset = 'rtllm'
     temp_mode = 'high_T'
     enable_quality_caching = True
     n_select = 3
-    path_config = None  # None Will use default ['direct', 'cpp', 'python']
+    path_config = None  # Will use default ['direct', 'cpp', 'python']
+    enable_early_stopping = True
+    enable_self_refinement = True  
+    max_self_refinement_iterations = 3 
     
     # Parse command line arguments
     for arg in sys.argv[1:]:
@@ -1031,23 +1373,39 @@ def main():
             path_config = arg.split('=')[1].split(',')
         elif arg in ['--no_cache', '--no-cache']:
             enable_quality_caching = False
+        elif arg.startswith('--early_stop='):
+            enable_early_stopping = arg.split('=')[1].lower() in ['true', '1', 'yes', 'on']
+        elif arg == '--early_stop':
+            enable_early_stopping = True
+        elif arg.startswith('--self_refine='):
+            enable_self_refinement = arg.split('=')[1].lower() in ['true', '1', 'yes', 'on']
+        elif arg == '--self_refine':
+            enable_self_refinement = True
+        elif arg == '--no_self_refine':
+            enable_self_refinement = False
+        elif arg.startswith('--max_refine_iters='):
+            max_self_refinement_iterations = int(arg.split('=')[1])
         elif arg == '--help':
             print("MoA-HLS: Multi-path HDL Generation with Configurable Agents")
             print("\nUsage: python MoA_HLS.py [options]")
             print("\nOptions:")
-            print("  --model=<name>       LLM model (default: qwen2.5:14b)")
-            print("  --layers=<n>         Number of layers (default: 3)")
-            print("  --dataset=<name>     Dataset: rtllm|verilogeval (default: rtllm)")
-            print("  --temp=<mode>        Temperature: low_T|high_T (default: high_T)")
-            print("  --n_select=<n>       Top-n selection per layer (default: 3)")
-            print("  --paths=<config>     Path configuration (default: direct,cpp,python)")
-            print("                       Examples:")
-            print("                         --paths=cpp,cpp,cpp       (3 C++ paths)")
-            print("                         --paths=python,python     (2 Python paths)")
-            print("                         --paths=direct,cpp        (direct + C++)")
-            print("  --no_cache           Disable quality caching")
+            print("  --model=<name>           LLM model (default: gpt-4o-mini)")
+            print("  --layers=<n>             Number of layers (default: 4)")
+            print("  --dataset=<name>         Dataset: rtllm|verilogeval (default: rtllm)")
+            print("  --temp=<mode>            Temperature: low_T|high_T (default: high_T)")
+            print("  --n_select=<n>           Top-n selection per layer (default: 3)")
+            print("  --paths=<config>         Path configuration (default: direct,cpp,python)")
+            print("                           Examples:")
+            print("                             --paths=cpp,cpp,cpp       (3 C++ paths)")
+            print("                             --paths=python,python     (2 Python paths)")
+            print("                             --paths=direct,cpp        (direct + C++)")
+            print("  --no_cache               Disable quality caching")
+            print("  --early_stop             Enable early stopping when perfect HDL found")
+            print("  --self_refine            Enable self-refinement (default: enabled)")
+            print("  --no_self_refine         Disable self-refinement")
+            print("  --max_refine_iters=<n>   Max refinement iterations (default: 3)")
             print("\nExample:")
-            print("  python MoA_HLS.py --model=qwen2.5:14b --layers=3 --paths=cpp,cpp,cpp")
+            print("  python MoA_HLS.py --model=gpt-4o-mini --layers=3 --paths=cpp,cpp,cpp --self_refine --max_refine_iters=3")
             return
     
     # Load designs
@@ -1066,7 +1424,10 @@ def main():
         temp_mode=temp_mode,
         enable_quality_caching=enable_quality_caching,
         n_select=n_select,
-        path_config=path_config
+        path_config=path_config,
+        enable_early_stopping=enable_early_stopping,
+        enable_self_refinement=enable_self_refinement,
+        max_self_refinement_iterations=max_self_refinement_iterations
     )
     
     # Run generation
