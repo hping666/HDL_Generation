@@ -1,0 +1,35 @@
+name: dl-py311-cu128
+channels:
+  - defaults
+dependencies:
+  - python=3.11        # 2.8 官方矩阵推荐 3.10–3.13
+  - pip>=24.2
+  - nomkl
+  - openblas
+  - ca-certificates
+  - openssl
+  - zlib
+  - xz
+  - tk
+  - pip:
+      # 从 PyTorch 官方 cu128 索引安装（关键）
+      - -f https://download.pytorch.org/whl/cu128
+
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - torchaudio==2.8.0
+      - numpy>=2.0
+      - scipy>=1.11
+      - pandas>=2.2
+      - matplotlib>=3.8
+      - jupyterlab>=4.0
+      - ipywidgets
+      - tqdm
+      - rich
+      - psutil
+      - tensorboard>=2.14
+      - transformers>=4.43
+      - accelerate>=0.33
+      - safetensors>=0.4
+      - einops>=0.7
+      - sentencepiece>=0.1.99
