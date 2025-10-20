@@ -42,7 +42,7 @@ export OPENAI_API_KEY="your-api-key"
 
 ### Basic Usage
 
-#### MoA_verify.py (Standard MoA)
+#### MoA_verify.py (Residual MoA)
 
 ```bash
 # Basic run with quality caching and self-refinement
@@ -56,7 +56,7 @@ python MoA_verify.py --models=qwen2.5-coder:7b,qwen2.5-coder:7b,qwen2.5-coder:7b
                      --max_refine_iters=3
 ```
 
-#### MoA_HLS.py (Multi-path MoA)
+#### MoA_HLS.py (Multi-path Residual MoA)
 
 ```bash
 # Multi-path generation with C++, Python, and direct paths
