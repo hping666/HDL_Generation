@@ -1,7 +1,7 @@
-RTLLM/*
-VerilogEval/*
-verilog/*
-verilog_temp/*
+RTLLM/
+VerilogEval/
+verilog/
+verilog_temp/
 private/*
 data/
 results/*
