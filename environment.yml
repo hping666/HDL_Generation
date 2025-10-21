@@ -1,4 +1,4 @@
-name: dl-py311-cu128
+name: HDL_Generation
 channels:
   - defaults
 dependencies:

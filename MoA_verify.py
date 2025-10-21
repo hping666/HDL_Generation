@@ -1151,7 +1151,7 @@ def main():
     # Default configuration
     layer_models = ['qwen2.5-coder:7b', 'qwen2.5-coder:7b', 'qwen2.5-coder:7b']
     aggregator_model = 'qwen2.5-coder:7b'
-    num_layers = 2
+    num_layers = 0
     dataset = 'rtllm'
     temp_mode = 'high_T'
     enable_quality_caching = True
