@@ -23,3 +23,8 @@ __pycache__/
 *.hdf5
 *.zip
 *.out
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
