@@ -29,8 +29,7 @@ A Mixture-of-Agents (MoA) framework for high-quality Hardware Description Langua
 
 ```bash
 # Install iverilog (for HDL testing)
-sudo apt-get install iverilog  # Ubuntu/Debian
-brew install icarus-verilog    # macOS
+pip install iverilog 
 
 # Setup LLM backend (choose one)
 # Option 1: Ollama (local)
