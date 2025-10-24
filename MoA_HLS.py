@@ -1,10 +1,15 @@
+MoA_HLS.py
 #!/usr/bin/env python3
 """
 MoA_HLS.py - Multi-path MoA with Configurable Intermediate Agents
 Implements a hybrid approach with configurable paths (direct, C++, Python) per layer.
 Uses dual-layer caching: HDL quality evaluation + intermediate code preservation.
+MODIFIED: Two-stage generation for cpp/python paths with information flow continuity
+  - Stage 1: Generate cpp/python using previous high-quality cpp/python
+  - Stage 2: Generate HDL using new cpp/python + previous high-quality HDL
 NEW: Added early stopping feature to terminate generation when perfect HDL is found
 NEW: Added self-refinement feature to iteratively fix HDL errors using iverilog feedback
+NEW: Added resume capability to continue from interrupted generation
 """
 
 import json
@@ -27,6 +32,7 @@ class DualLayerCacheManager(HDLCacheManager):
     Extended cache manager supporting dual-layer storage:
     - HDL layer: for quality evaluation and selection
     - Intermediate code layer: for path-specific references
+    MODIFIED: Enhanced to support top-n intermediate code retrieval
     """
     
     def __init__(self, cache_dir: Path, design_name: str, trial_num: int):
@@ -100,11 +106,18 @@ class DualLayerCacheManager(HDLCacheManager):
         
         self._save_cache()
     
-    def get_best_intermediate_code(self, language: str, up_to_layer: Optional[int] = None) -> Optional[Dict]:
+    def get_top_intermediate_codes(self, n: int, language: str, up_to_layer: Optional[int] = None) -> List[Dict]:
         """
-        Get the highest quality intermediate code for a specific language
+        MODIFIED: Get top n highest quality intermediate codes for a specific language
         
-        Returns: Dict with 'code', 'language', 'hdl_quality' or None
+        Args:
+            n: Number of codes to retrieve
+            language: 'cpp' or 'python'
+            up_to_layer: Only consider codes from layers 0 to up_to_layer (inclusive)
+        
+        Returns:
+            List of dicts with 'code', 'language', 'hdl_quality', sorted by quality (highest first)
+            If cache has fewer than n codes, return all available codes
         """
         candidates = []
         
@@ -114,28 +127,35 @@ class DualLayerCacheManager(HDLCacheManager):
             candidates.append(entry)
         
         if not candidates:
-            return None
+            return []
         
-        # Return the one with highest HDL quality
-        best = max(candidates, key=lambda x: x["hdl_quality"])
-        return {
-            "code": best["code"],
-            "language": best["language"],
-            "hdl_quality": best["hdl_quality"]
-        }
+        # Sort by HDL quality (descending) and take top n (or all if fewer than n)
+        sorted_candidates = sorted(candidates, key=lambda x: x["hdl_quality"], reverse=True)
+        top_n = sorted_candidates[:min(n, len(sorted_candidates))]
+        
+        # Return as list of dicts with required fields
+        return [
+            {
+                "code": entry["code"],
+                "language": entry["language"],
+                "hdl_quality": entry["hdl_quality"]
+            }
+            for entry in top_n
+        ]
 
 
 class MoAHLSGenerator:
     """
     Multi-path MoA Generator with Configurable Intermediate Agents
     All paths use the same LLM model
+    MODIFIED: Enhanced cpp/python paths with two-stage generation
     """
     
     def __init__(self, model: str, num_layers: int, dataset: str = "rtllm",
                  temp_mode: str = "low_T", enable_quality_caching: bool = True,
-                 n_select: int = 3, path_config: List[str] = None,
+                 n_select: int = 3, n_select_intermediate: int = 2, path_config: List[str] = None,
                  enable_early_stopping: bool = False, enable_self_refinement: bool = False,
-                 max_self_refinement_iterations: int = 3):
+                 max_self_refinement_iterations: int = 3, enable_resume: bool = False):
         """
         Initialize MoA-HLS Generator
         
@@ -145,7 +165,8 @@ class MoAHLSGenerator:
             dataset: 'rtllm' or 'verilogeval'
             temp_mode: 'low_T' or 'high_T'
             enable_quality_caching: Whether to use quality-based caching
-            n_select: Number of top codes to select per layer
+            n_select: Number of top HDL codes to select per layer
+            n_select_intermediate: Number of top cpp/python codes to use in Stage 1 (MODIFIED)
             path_config: List of path types for each MoA layer
                         e.g., ['direct', 'cpp', 'python'] or ['cpp', 'cpp', 'cpp']
                         Valid values: 'direct', 'cpp', 'python'
@@ -153,6 +174,7 @@ class MoAHLSGenerator:
             enable_early_stopping: True to stop generation when perfect HDL (score=1.0) is found
             enable_self_refinement: True to iteratively fix HDL errors using iverilog feedback
             max_self_refinement_iterations: Maximum refinement iterations (default: 3)
+            enable_resume: True to skip already generated designs and trials (default: False)
         """
         self.model = model
         self.num_layers = num_layers
@@ -160,8 +182,10 @@ class MoAHLSGenerator:
         self.temp_mode = temp_mode
         self.enable_quality_caching = enable_quality_caching
         self.n_select = n_select
+        self.n_select_intermediate = n_select_intermediate  # MODIFIED: New parameter
         self.enable_early_stopping = enable_early_stopping
         self.enable_self_refinement = enable_self_refinement
+        self.enable_resume = enable_resume
         
         # Self-refinement parameters (only effective when quality caching is enabled)
         self.max_self_refinement_iterations = max_self_refinement_iterations
@@ -191,7 +215,7 @@ class MoAHLSGenerator:
         else:
             self.quality_evaluator = None
         
-        # Initialize LLM interface - Modified: Support both Ollama and OpenAI models
+        # Initialize LLM interface
         self.llm = create_llm_interface(model, temp_mode)
         
         # Apply extended context for MoA
@@ -237,7 +261,7 @@ class MoAHLSGenerator:
         ]
         
         if self.enable_quality_caching:
-            folder_parts.append(f"QCache_N{self.n_select}")
+            folder_parts.append(f"QCache_N{self.n_select}_NI{self.n_select_intermediate}")  # MODIFIED: Add n_select_intermediate
         
         if self.enable_early_stopping:
             folder_parts.append("EarlyStop")
@@ -270,7 +294,7 @@ class MoAHLSGenerator:
         
         model_str = self.model.replace(":", "-").replace(".", "_")
         path_str = "_".join(self.path_config)
-        folder_name = f"MoA_HLS_{self.temp_mode}_L{self.num_layers}_{model_str}_paths_{path_str}_QCache_N{self.n_select}"
+        folder_name = f"MoA_HLS_{self.temp_mode}_L{self.num_layers}_{model_str}_paths_{path_str}_QCache_N{self.n_select}_NI{self.n_select_intermediate}"  # MODIFIED
         
         if self.enable_early_stopping:
             folder_name += "_EarlyStop"
@@ -366,47 +390,42 @@ class MoAHLSGenerator:
 Original specification:
 {description}
 
-{intermediate_language.upper()} reference implementation:
-{intermediate_code}
+Reference {intermediate_language.upper()} code:
+{intermediate_code[:500]}...
 
-Current {self.language} code (Refinement attempt {iteration}/{self.max_self_refinement_iterations}):
+Failed {self.language} code:
 {original_code}
 
-Error encountered:
+Error message:
 {error_message}
-
-The {intermediate_language.upper()} reference is correct - focus on fixing the {self.language} translation.
 """
         else:
-            # For direct path: standard refinement
-            base_context = f"""You are debugging {self.language} code that failed testing.
+            base_context = f"""You are fixing {self.language} code.
 
 Original specification:
 {description}
 
-Current code (Refinement attempt {iteration}/{self.max_self_refinement_iterations}):
+Failed {self.language} code:
 {original_code}
 
-Error encountered:
+Error message:
 {error_message}
 """
         
         # Error-specific guidance
         if error_type == "syntax_error":
             specific_guidance = """
-SYNTAX ERROR DETECTED. Common issues:
-1. Variable/genvar redeclaration - check all loop variables and ensure unique naming
-2. Part select with non-constant expressions - use parameters or constants
-3. Missing/mismatched module declarations
-4. Incorrect port declarations or signal types
-
-Fix the syntax errors while preserving the original logic.
+SYNTAX ERROR. Common issues:
+1. Missing semicolons
+2. Incorrect port declarations
+3. Undefined signals or modules
 """
         
         elif error_type == "compilation_error":
-            if "Unknown module type" in error_message:
+            # Check for missing module errors
+            if "error: Unknown module type" in error_message or "not found" in error_message.lower():
                 specific_guidance = """
-MISSING/UNKNOWN MODULE ERROR. Possible causes:
+MISSING MODULE ERROR. Common causes:
 1. Module name mismatch with testbench expectations
 2. Missing submodule definitions - you must implement ALL modules in a single file
 3. Hierarchical design split incorrectly
@@ -578,7 +597,7 @@ Output the corrected {self.language} code now:"""
         return best_code, best_quality, self.max_self_refinement_iterations if iteration == self.max_self_refinement_iterations else iteration, original_quality
     
     def extract_code(self, response: str) -> Optional[str]:
-        """Extract HDL code from LLM response - reuse from OllamaInterface"""
+        """Extract HDL code from LLM response"""
         return self.llm.extract_verilog(response, self.dataset)
     
     def validate_hdl_code(self, code: str) -> bool:
@@ -804,51 +823,77 @@ Output the synthesized Verilog module:"""
     
     def generate_path_cpp_chain(self, description: str, 
                                 previous_hdl: List[Dict] = None,
-                                reference_cpp: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                                previous_cpp: List[Dict] = None) -> Tuple[Optional[str], Optional[str]]:
         """
-        C++ chain path: Spec → C++ → HDL
-        Returns: (hdl_code, cpp_code)
+        MODIFIED: C++ chain path with two-stage generation
+        Stage 1: Generate C++ using description + previous high-quality C++
+        Stage 2: Generate HDL using description + new C++ + previous high-quality HDL
+        
+        Args:
+            description: Design specification
+            previous_hdl: Previous high-quality HDL codes
+            previous_cpp: Previous high-quality C++ codes (MODIFIED)
+        
+        Returns:
+            Tuple of (hdl_code, cpp_code)
         """
         
-        # Step 1: Generate C++ reference
-        if reference_cpp:
-            # Use provided reference C++ code
-            cpp_code = reference_cpp
-        else:
-            # Generate new C++ code
-            if previous_hdl:
-                hdl_examples = "\n\n".join([
-                    f"Previous implementation {i+1}:\n{entry['code'][:800]}"
-                    for i, entry in enumerate(previous_hdl[:2])
-                ])
-                cpp_prompt = f"""Write C++ code demonstrating the functional logic.
+        # ============ STAGE 1: Generate C++ ============
+        if previous_cpp and len(previous_cpp) > 0:
+            # Use previous high-quality C++ codes as reference
+            cpp_examples = "\n\n".join([
+                f"Previous C++ implementation {i+1} (HDL quality: {entry['hdl_quality']:.2f}):\n{entry['code'][:800]}"
+                for i, entry in enumerate(previous_cpp)
+            ])
+            cpp_prompt = f"""Write improved C++ code demonstrating the functional logic.
 
 Specification:
 {description}
 
-Previous HDL implementations:
+Previous C++ implementations:
+{cpp_examples}
+
+Write improved C++ code showing the algorithm:"""
+        else:
+            # First layer: no previous C++ available
+            cpp_prompt = f"""Write C++ code demonstrating the functional logic.
+
+Specification:
+{description}
+
+Write simple C++ code showing the algorithm:"""
+        
+        cpp_response = self.llm.generate_response(cpp_prompt, self.system_prompt_intermediate)
+        
+        if not cpp_response:
+            return None, None
+        
+        cpp_code = self.extract_cpp_code(cpp_response)
+        if not cpp_code:
+            return None, None
+        
+        # ============ STAGE 2: Generate HDL ============
+        # Combine new C++ with previous HDL references
+        if previous_hdl:
+            hdl_examples = "\n\n".join([
+                f"Previous HDL implementation {i+1} (quality: {entry.get('quality_score', 0):.2f}):\n{entry['code'][:800]}"
+                for i, entry in enumerate(previous_hdl[:2])
+            ])
+            hdl_prompt = f"""Translate this C++ reference to {self.language}.
+
+Original specification:
+{description}
+
+New C++ reference code:
+{cpp_code}
+
+Previous HDL implementations for reference:
 {hdl_examples}
 
-Write simple C++ code showing the algorithm:"""
-            else:
-                cpp_prompt = f"""Write C++ code demonstrating the functional logic.
-
-Specification:
-{description}
-
-Write simple C++ code showing the algorithm:"""
-            
-            cpp_response = self.llm.generate_response(cpp_prompt, self.system_prompt_intermediate)
-            
-            if not cpp_response:
-                return None, None
-            
-            cpp_code = self.extract_cpp_code(cpp_response)
-            if not cpp_code:
-                return None, None
-        
-        # Step 2: Translate C++ to HDL
-        hdl_prompt = f"""Translate this C++ reference to {self.language}.
+Generate the {self.language} module implementing this logic:"""
+        else:
+            # First layer: no previous HDL available
+            hdl_prompt = f"""Translate this C++ reference to {self.language}.
 
 Original specification:
 {description}
@@ -868,49 +913,77 @@ Generate the {self.language} module implementing this logic:"""
     
     def generate_path_python_chain(self, description: str,
                                    previous_hdl: List[Dict] = None,
-                                   reference_python: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                                   previous_python: List[Dict] = None) -> Tuple[Optional[str], Optional[str]]:
         """
-        Python chain path: Spec → Python → HDL
-        Returns: (hdl_code, python_code)
+        MODIFIED: Python chain path with two-stage generation
+        Stage 1: Generate Python using description + previous high-quality Python
+        Stage 2: Generate HDL using description + new Python + previous high-quality HDL
+        
+        Args:
+            description: Design specification
+            previous_hdl: Previous high-quality HDL codes
+            previous_python: Previous high-quality Python codes (MODIFIED)
+        
+        Returns:
+            Tuple of (hdl_code, python_code)
         """
         
-        # Step 1: Generate Python reference
-        if reference_python:
-            python_code = reference_python
-        else:
-            if previous_hdl:
-                hdl_examples = "\n\n".join([
-                    f"Previous implementation {i+1}:\n{entry['code'][:800]}"
-                    for i, entry in enumerate(previous_hdl[:2])
-                ])
-                py_prompt = f"""Write Python code demonstrating the functional logic.
+        # ============ STAGE 1: Generate Python ============
+        if previous_python and len(previous_python) > 0:
+            # Use previous high-quality Python codes as reference
+            py_examples = "\n\n".join([
+                f"Previous Python implementation {i+1} (HDL quality: {entry['hdl_quality']:.2f}):\n{entry['code'][:800]}"
+                for i, entry in enumerate(previous_python)
+            ])
+            py_prompt = f"""Write improved Python code demonstrating the functional logic.
 
 Specification:
 {description}
 
-Previous HDL implementations:
+Previous Python implementations:
+{py_examples}
+
+Write improved Python code showing the algorithm:"""
+        else:
+            # First layer: no previous Python available
+            py_prompt = f"""Write Python code demonstrating the functional logic.
+
+Specification:
+{description}
+
+Write simple Python code showing the algorithm:"""
+        
+        py_response = self.llm.generate_response(py_prompt, self.system_prompt_intermediate)
+        
+        if not py_response:
+            return None, None
+        
+        python_code = self.extract_python_code(py_response)
+        if not python_code:
+            return None, None
+        
+        # ============ STAGE 2: Generate HDL ============
+        # Combine new Python with previous HDL references
+        if previous_hdl:
+            hdl_examples = "\n\n".join([
+                f"Previous HDL implementation {i+1} (quality: {entry.get('quality_score', 0):.2f}):\n{entry['code'][:800]}"
+                for i, entry in enumerate(previous_hdl[:2])
+            ])
+            hdl_prompt = f"""Translate this Python reference to {self.language}.
+
+Original specification:
+{description}
+
+New Python reference code:
+{python_code}
+
+Previous HDL implementations for reference:
 {hdl_examples}
 
-Write simple Python code showing the algorithm:"""
-            else:
-                py_prompt = f"""Write Python code demonstrating the functional logic.
-
-Specification:
-{description}
-
-Write simple Python code showing the algorithm:"""
-            
-            py_response = self.llm.generate_response(py_prompt, self.system_prompt_intermediate)
-            
-            if not py_response:
-                return None, None
-            
-            python_code = self.extract_python_code(py_response)
-            if not python_code:
-                return None, None
-        
-        # Step 2: Translate Python to HDL
-        hdl_prompt = f"""Translate this Python reference to {self.language}.
+Generate the {self.language} module implementing this logic:"""
+        else:
+            # First layer: no previous HDL available
+            hdl_prompt = f"""Translate this Python reference to {self.language}.
 
 Original specification:
 {description}
@@ -930,18 +1003,18 @@ Generate the {self.language} module implementing this logic:"""
     
     def generate_single_path(self, path_type: str, description: str, design_name: str,
                             previous_hdl: List[Dict] = None,
-                            reference_cpp: Optional[str] = None,
-                            reference_python: Optional[str] = None) -> Optional[Dict]:
+                            previous_cpp: List[Dict] = None,
+                            previous_python: List[Dict] = None) -> Optional[Dict]:
         """
-        Generate HDL via a single path with optional self-refinement
+        MODIFIED: Generate HDL via a single path with optional self-refinement
         
         Args:
             path_type: 'direct', 'cpp', or 'python'
             description: Design specification
             design_name: Name of the design
             previous_hdl: Previous layer HDL codes
-            reference_cpp: Reference C++ code (if available)
-            reference_python: Reference Python code (if available)
+            previous_cpp: Previous layer C++ codes (MODIFIED)
+            previous_python: Previous layer Python codes (MODIFIED)
         
         Returns:
             Dict with HDL code, quality score, path type, optional intermediate code, and original_quality
@@ -957,14 +1030,14 @@ Generate the {self.language} module implementing this logic:"""
         elif path_type == 'cpp':
             print("C", end="", flush=True)
             hdl_code, intermediate_code = self.generate_path_cpp_chain(
-                description, previous_hdl, reference_cpp
+                description, previous_hdl, previous_cpp  # MODIFIED: Pass previous_cpp
             )
             intermediate_language = "cpp"
             
         elif path_type == 'python':
             print("P", end="", flush=True)
             hdl_code, intermediate_code = self.generate_path_python_chain(
-                description, previous_hdl, reference_python
+                description, previous_hdl, previous_python  # MODIFIED: Pass previous_python
             )
             intermediate_language = "python"
         
@@ -1009,25 +1082,26 @@ Generate the {self.language} module implementing this logic:"""
                                  design_name: str, cache_manager: Optional[DualLayerCacheManager] = None,
                                  previous_codes: List[Dict] = None) -> List[Dict]:
         """
-        Generate HDL via configured paths using same LLM
+        MODIFIED: Generate HDL via configured paths using same LLM
+        Now retrieves previous intermediate codes for cpp/python paths
         
-        Returns: List of dicts with HDL code, quality score, path, and optional intermediate code
+        Returns:
+            List of dicts with HDL code, quality score, path, and optional intermediate code
         """
         layer_outputs = []
         
-        # Get optional intermediate code references from cache
-        reference_cpp = None
-        reference_python = None
+        # MODIFIED: Get previous intermediate codes from cache for Stage 1
+        previous_cpp = None
+        previous_python = None
         
-        if cache_manager and previous_codes and layer_idx > 0:
-            # Get best intermediate codes from previous layers
-            best_cpp = cache_manager.get_best_intermediate_code("cpp", up_to_layer=layer_idx-1)
-            best_python = cache_manager.get_best_intermediate_code("python", up_to_layer=layer_idx-1)
-            
-            if best_cpp:
-                reference_cpp = best_cpp["code"]
-            if best_python:
-                reference_python = best_python["code"]
+        if cache_manager and layer_idx > 0:
+            # Get top n_select_intermediate intermediate codes from previous layers
+            previous_cpp = cache_manager.get_top_intermediate_codes(
+                self.n_select_intermediate, "cpp", up_to_layer=layer_idx-1
+            )
+            previous_python = cache_manager.get_top_intermediate_codes(
+                self.n_select_intermediate, "python", up_to_layer=layer_idx-1
+            )
         
         # Generate HDL for each configured path
         for path_type in self.path_config:
@@ -1036,14 +1110,40 @@ Generate the {self.language} module implementing this logic:"""
                 description=description,
                 design_name=design_name,
                 previous_hdl=previous_codes,
-                reference_cpp=reference_cpp,
-                reference_python=reference_python
+                previous_cpp=previous_cpp,  # MODIFIED: Pass previous C++ codes
+                previous_python=previous_python  # MODIFIED: Pass previous Python codes
             )
             
             if result:
                 layer_outputs.append(result)
         
         return layer_outputs
+    
+    def check_design_completion(self, design_name: str) -> Dict:
+        """
+        Check which trials are already completed for a design
+        
+        Returns:
+            Dict with 'all_complete' (bool), 'completed_trials' (list), 'pending_trials' (list)
+        """
+        completed_trials = []
+        pending_trials = []
+        
+        for i in range(1, Config.N_SAMPLES + 1):
+            trial_file = self.verilog_dir / f"t{i}" / f"{design_name}{self.file_extension}"
+            
+            if trial_file.exists() and trial_file.stat().st_size > 0:
+                # File exists and is not empty
+                completed_trials.append(i)
+            else:
+                pending_trials.append(i)
+        
+        return {
+            "all_complete": len(pending_trials) == 0,
+            "completed_trials": completed_trials,
+            "pending_trials": pending_trials,
+            "completion_ratio": f"{len(completed_trials)}/{Config.N_SAMPLES}"
+        }
     
     def generate_trial(self, description: str, trial_num: int, design_name: str) -> Optional[str]:
         """
@@ -1072,6 +1172,7 @@ Generate the {self.language} module implementing this logic:"""
                 previous_codes = None
             else:
                 if self.enable_quality_caching:
+                    # MODIFIED: Use flexible selection (returns all if fewer than n_select)
                     previous_codes = cache_manager.get_top_quality_codes(
                         self.n_select, up_to_layer=layer_idx-1
                     )
@@ -1082,7 +1183,7 @@ Generate the {self.language} module implementing this logic:"""
                             key=lambda x: x.get("quality_score", 0),
                             reverse=True
                         )
-                        previous_codes = sorted_codes[:self.n_select]
+                        previous_codes = sorted_codes[:min(self.n_select, len(sorted_codes))]
                     else:
                         previous_codes = None
             
@@ -1113,7 +1214,7 @@ Generate the {self.language} module implementing this logic:"""
         print(" AGG", end="", flush=True)
         
         if self.enable_quality_caching and cache_manager:
-            # Get top-n codes for final aggregation
+            # MODIFIED: Use flexible selection
             final_input = cache_manager.get_top_quality_codes(self.n_select)
             
             if final_input:
@@ -1182,7 +1283,7 @@ Generate the {self.language} module implementing this logic:"""
         return None
     
     def generate_design_trials(self, design: Dict) -> Dict:
-        """Generate all trials for a design"""
+        """Generate all trials for a design with resume capability"""
         design_name = design["name"]
         desc_file = design["description"]
         
@@ -1197,93 +1298,123 @@ Generate the {self.language} module implementing this logic:"""
                 "successful_count": 0
             }
         
-        print(f"Generating {design_name}:")
+        # Check completion status if resume is enabled
+        if self.enable_resume:
+            completion_status = self.check_design_completion(design_name)
+            
+            if completion_status["all_complete"]:
+                print(f"Skipping {design_name}: All trials complete ({completion_status['completion_ratio']})")
+                return {
+                    "design": design_name,
+                    "trials": [{"trial": i, "skipped": True, "reason": "already_complete"} 
+                              for i in completion_status["completed_trials"]],
+                    "successful_count": len(completion_status["completed_trials"]),
+                    "total_trials": Config.N_SAMPLES,
+                    "resumed": True,
+                    "all_skipped": True
+                }
+            elif completion_status["completed_trials"]:
+                print(f"Resuming {design_name}: {completion_status['completion_ratio']} complete, generating remaining...")
+            else:
+                print(f"Generating {design_name}:")
+        else:
+            print(f"Generating {design_name}:")
         
-        trials = []
-        successful_count = 0
+        # Determine which trials to generate
+        if self.enable_resume:
+            completion_status = self.check_design_completion(design_name)
+            trials_to_generate = completion_status["pending_trials"]
+        else:
+            trials_to_generate = list(range(1, Config.N_SAMPLES + 1))
         
-        for i in range(Config.N_SAMPLES):
-            trial_num = i + 1
-            code = self.generate_trial(description, trial_num, design_name)
+        # Generate trials
+        trial_results = []
+        for i in trials_to_generate:
+            code = self.generate_trial(description, i, design_name)
             
             if code:
-                trial_file = self.verilog_dir / f"t{trial_num}" / f"{design_name}{self.file_extension}"
-                try:
-                    with open(trial_file, 'w', encoding='utf-8') as f:
-                        f.write(code)
-                    trials.append({
-                        "trial": trial_num,
-                        "file": str(trial_file),
-                        "success": True
-                    })
-                    successful_count += 1
-                except Exception as e:
-                    trials.append({
-                        "trial": trial_num,
-                        "error": f"Save failed: {e}",
-                        "success": False
-                    })
-            else:
-                trials.append({
-                    "trial": trial_num,
-                    "error": "Generation failed",
-                    "success": False
+                output_file = self.verilog_dir / f"t{i}" / f"{design_name}{self.file_extension}"
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(code)
+                
+                trial_results.append({
+                    "trial": i,
+                    "success": True,
+                    "file": str(output_file)
                 })
-            
-            time.sleep(0.5)
+            else:
+                trial_results.append({
+                    "trial": i,
+                    "success": False,
+                    "error": "Generation failed"
+                })
+        
+        # Add skipped trials if resuming
+        if self.enable_resume:
+            completion_status = self.check_design_completion(design_name)
+            for i in completion_status["completed_trials"]:
+                if i not in trials_to_generate:
+                    trial_results.append({
+                        "trial": i,
+                        "skipped": True,
+                        "reason": "already_complete"
+                    })
+        
+        successful_count = sum(1 for t in trial_results if t.get("success", False) or t.get("skipped", False))
         
         return {
             "design": design_name,
-            "trials": trials,
+            "trials": sorted(trial_results, key=lambda x: x["trial"]),
             "successful_count": successful_count,
             "total_trials": Config.N_SAMPLES
         }
     
-    def run_generation(self, designs: List[Dict]):
-        """Run MoA-HLS generation for all designs"""
-        print("MoA-HLS: Multi-path HDL Generation with Configurable Agents")
-        print(f"Dataset: {self.dataset} ({self.language})")
+    def run_generation(self, designs: List[Dict]) -> Tuple[Path, Path]:
+        """Run generation for all designs"""
+        print(f"\n{'='*80}")
+        print(f"MoA-HLS Generation")
+        print(f"{'='*80}")
         print(f"Model: {self.model}")
-        print(f"Temperature: {self.temp_mode}")
         print(f"Layers: {self.num_layers}")
-        print(f"Path Configuration: {self.path_config} ({len(self.path_config)} paths per layer)")
-        
-        # Print early stopping status
-        if self.enable_early_stopping:
-            print("✓ Early Stopping: ENABLED (will stop when perfect HDL found)")
-        else:
-            print("✗ Early Stopping: DISABLED")
-        
-        # Print self-refinement status
-        if self.enable_self_refinement:
-            print(f"✓ Self-Refinement: ENABLED (max {self.max_self_refinement_iterations} iterations)")
-        else:
-            print("✗ Self-Refinement: DISABLED")
-        
+        print(f"Path config: {self.path_config}")
+        print(f"Temperature mode: {self.temp_mode}")
+        print(f"Dataset: {self.dataset}")
+        print(f"Quality caching: {self.enable_quality_caching}")
         if self.enable_quality_caching:
-            print(f"Quality caching: Enabled (select top-{self.n_select} per layer)")
-            print(f"Cache directory: {self.cache_dir}")
-        else:
-            print("Quality caching: Disabled")
-        
-        print("=" * 70)
+            print(f"  HDL selection (n_select): {self.n_select}")
+            print(f"  Intermediate selection (n_select_intermediate): {self.n_select_intermediate}")  # MODIFIED
+        print(f"Early stopping: {self.enable_early_stopping}")
+        print(f"Self-refinement: {self.enable_self_refinement}")
+        if self.enable_self_refinement:
+            print(f"  Max refinement iterations: {self.max_self_refinement_iterations}")
+        print(f"Resume: {self.enable_resume}")
+        print(f"Trials per design: {Config.N_SAMPLES}")
+        print(f"Total designs: {len(designs)}")
+        print(f"{'='*80}\n")
         
         results = []
         total_successful = 0
+        total_skipped = 0
         
         for i, design in enumerate(designs, 1):
             print(f"[{i}/{len(designs)}] ", end="")
             result = self.generate_design_trials(design)
-            results.append(result)
-            total_successful += result.get("successful_count", 0)
-            time.sleep(1)
+            
+            if result.get("resumed") and result.get("all_skipped"):
+                total_skipped += result["successful_count"]
+                total_successful += result["successful_count"]
+            else:
+                successful = result["successful_count"]
+                total_successful += successful
+                if self.enable_resume:
+                    skipped = sum(1 for t in result["trials"] if t.get("skipped", False))
+                    total_skipped += skipped
         
         # Save generation summary
         summary = {
-            "method": "MoA_HLS",
             "model": self.model,
-            "dataset": self.dataset,
-            "language": self.language,
             "temp_mode": self.temp_mode,
             "num_layers": self.num_layers,
             "path_config": self.path_config,
@@ -1292,7 +1423,9 @@ Generate the {self.language} module implementing this logic:"""
             "early_stopping_enabled": self.enable_early_stopping,
             "self_refinement_enabled": self.enable_self_refinement,
             "max_self_refinement_iterations": self.max_self_refinement_iterations if self.enable_self_refinement else None,
+            "resume_enabled": self.enable_resume,
             "n_select": self.n_select if self.enable_quality_caching else None,
+            "n_select_intermediate": self.n_select_intermediate if self.enable_quality_caching else None,  # MODIFIED
             "cache_directory": str(self.cache_dir) if self.enable_quality_caching else None,
             "timestamp": datetime.now().isoformat(),
             "total_designs": len(designs),
@@ -1302,10 +1435,19 @@ Generate the {self.language} module implementing this logic:"""
             "details": results
         }
         
+        # Add resume statistics
+        if self.enable_resume:
+            summary["skipped_trials"] = total_skipped
+            summary["newly_generated_trials"] = total_successful - total_skipped
+            summary["skip_rate"] = f"{total_skipped/(len(designs)*Config.N_SAMPLES)*100:.1f}%"
+        
         with open(self.verilog_dir / "generation_summary.json", 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2)
         
         print(f"\nGeneration complete: {total_successful}/{len(designs)*Config.N_SAMPLES} successful")
+        if self.enable_resume and total_skipped > 0:
+            print(f"  Skipped (already complete): {total_skipped}")
+            print(f"  Newly generated: {total_successful - total_skipped}")
         print(f"Output: {self.verilog_dir}")
         
         if self.enable_quality_caching:
@@ -1351,10 +1493,12 @@ def main():
     temp_mode = 'high_T'
     enable_quality_caching = True
     n_select = 3
-    path_config = None  # Will use default ['direct', 'cpp', 'python']
+    n_select_intermediate = 2  # MODIFIED: New parameter
+    path_config = ['direct', 'cpp', 'cpp', 'python', 'python', 'python']
     enable_early_stopping = True
     enable_self_refinement = True  
-    max_self_refinement_iterations = 3 
+    max_self_refinement_iterations = 3
+    enable_resume = True
     
     # Parse command line arguments
     for arg in sys.argv[1:]:
@@ -1368,6 +1512,8 @@ def main():
             temp_mode = arg.split('=')[1]
         elif arg.startswith('--n_select='):
             n_select = int(arg.split('=')[1])
+        elif arg.startswith('--n_select_intermediate='):  # MODIFIED: New CLI parameter
+            n_select_intermediate = int(arg.split('=')[1])
         elif arg.startswith('--paths='):
             # Parse path configuration, e.g., --paths=cpp,cpp,cpp or --paths=direct,python
             path_config = arg.split('=')[1].split(',')
@@ -1385,27 +1531,37 @@ def main():
             enable_self_refinement = False
         elif arg.startswith('--max_refine_iters='):
             max_self_refinement_iterations = int(arg.split('=')[1])
+        elif arg.startswith('--resume='):
+            enable_resume = arg.split('=')[1].lower() in ['true', '1', 'yes', 'on']
+        elif arg == '--resume':
+            enable_resume = True
         elif arg == '--help':
-            print("MoA-HLS: Multi-path HDL Generation with Configurable Agents")
+            print("MoA-HLS: Multi-path HDL Generation with Configurable Agents and Two-Stage Generation")
             print("\nUsage: python MoA_HLS.py [options]")
             print("\nOptions:")
-            print("  --model=<name>           LLM model (default: gpt-4o-mini)")
-            print("  --layers=<n>             Number of layers (default: 4)")
-            print("  --dataset=<name>         Dataset: rtllm|verilogeval (default: rtllm)")
-            print("  --temp=<mode>            Temperature: low_T|high_T (default: high_T)")
-            print("  --n_select=<n>           Top-n selection per layer (default: 3)")
-            print("  --paths=<config>         Path configuration (default: direct,cpp,python)")
-            print("                           Examples:")
-            print("                             --paths=cpp,cpp,cpp       (3 C++ paths)")
-            print("                             --paths=python,python     (2 Python paths)")
-            print("                             --paths=direct,cpp        (direct + C++)")
-            print("  --no_cache               Disable quality caching")
-            print("  --early_stop             Enable early stopping when perfect HDL found")
-            print("  --self_refine            Enable self-refinement (default: enabled)")
-            print("  --no_self_refine         Disable self-refinement")
-            print("  --max_refine_iters=<n>   Max refinement iterations (default: 3)")
-            print("\nExample:")
-            print("  python MoA_HLS.py --model=gpt-4o-mini --layers=3 --paths=cpp,cpp,cpp --self_refine --max_refine_iters=3")
+            print("  --model=<n>                  LLM model (default: gpt-4o-mini)")
+            print("  --layers=<n>                 Number of layers (default: 4)")
+            print("  --dataset=<n>                Dataset: rtllm|verilogeval (default: rtllm)")
+            print("  --temp=<mode>                Temperature: low_T|high_T (default: high_T)")
+            print("  --n_select=<n>               Top-n HDL selection per layer (default: 3)")
+            print("  --n_select_intermediate=<n>  Top-n intermediate code selection (default: 2)")
+            print("  --paths=<config>             Path configuration (default: direct,cpp,python)")
+            print("                               Examples:")
+            print("                                 --paths=cpp,cpp,cpp       (3 C++ paths)")
+            print("                                 --paths=python,python     (2 Python paths)")
+            print("                                 --paths=direct,cpp        (direct + C++)")
+            print("  --no_cache                   Disable quality caching")
+            print("  --early_stop                 Enable early stopping when perfect HDL found")
+            print("  --self_refine                Enable self-refinement (default: enabled)")
+            print("  --no_self_refine             Disable self-refinement")
+            print("  --max_refine_iters=<n>       Max refinement iterations (default: 3)")
+            print("  --resume                     Enable resume from interrupted generation")
+            print("\nExamples:")
+            print("  # Normal generation with two-stage cpp path")
+            print("  python MoA_HLS.py --model=gpt-4o-mini --layers=3 --paths=cpp,cpp,cpp --n_select_intermediate=2")
+            print("")
+            print("  # Resume interrupted generation")
+            print("  python MoA_HLS.py --model=gpt-4o-mini --layers=3 --paths=cpp,cpp,cpp --resume")
             return
     
     # Load designs
@@ -1424,10 +1580,12 @@ def main():
         temp_mode=temp_mode,
         enable_quality_caching=enable_quality_caching,
         n_select=n_select,
+        n_select_intermediate=n_select_intermediate,  # MODIFIED: Pass new parameter
         path_config=path_config,
         enable_early_stopping=enable_early_stopping,
         enable_self_refinement=enable_self_refinement,
-        max_self_refinement_iterations=max_self_refinement_iterations
+        max_self_refinement_iterations=max_self_refinement_iterations,
+        enable_resume=enable_resume
     )
     
     # Run generation

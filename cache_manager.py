@@ -1,6 +1,8 @@
+cache_manager.py
 #!/usr/bin/env python3
 """
 Cache Manager for storing and retrieving HDL code with quality scores during MoA layers
+MODIFIED: Enhanced intermediate code retrieval to support top-n selection
 """
 
 import json
@@ -108,6 +110,7 @@ class HDLCacheManager:
         
         Returns:
             List of HDL entries sorted by quality score (highest first)
+            If cache has fewer than n codes, return all available codes
         """
         all_codes = []
         
@@ -120,9 +123,9 @@ class HDLCacheManager:
             
             all_codes.extend(outputs)
         
-        # Sort by quality score (descending) and take top n
+        # Sort by quality score (descending) and take top n (or all if fewer than n)
         sorted_codes = sorted(all_codes, key=lambda x: x["quality_score"], reverse=True)
-        return sorted_codes[:n]
+        return sorted_codes[:min(n, len(sorted_codes))]
     
     def get_layer_statistics(self) -> Dict:
         """Get statistics about cached data"""

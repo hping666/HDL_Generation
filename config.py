@@ -1,3 +1,4 @@
+config.py
 #!/usr/bin/env python3
 """
 Configuration for RTLLM (Verilog) and VerilogEval (SystemVerilog) Benchmark Testing with Qwen2.5
@@ -39,12 +40,12 @@ class Config:
     TEMPERATURE_MODES = ["low_T", "high_T"]
     
     # Directories for RTLLM dataset
-    RTLLM_DIR = Path("./RTLLM")
+    RTLLM_DIR = Path("./data/RTLLM")
     VERILOG_BASE_DIR = Path("./verilog")
     RESULT_BASE_DIR = Path("./result")
     
     # Directories for VerilogEval dataset
-    VERILOGEVAL_DIR = Path("./VerilogEval")
+    VERILOGEVAL_DIR = Path("./data/VerilogEval")
     VERILOG_EVAL_BASE_DIR = Path("./verilog_eval")
     RESULT_EVAL_BASE_DIR = Path("./result_eval")
     
